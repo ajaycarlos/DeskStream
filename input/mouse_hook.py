@@ -106,10 +106,13 @@ class MouseHookManager:
         self.android_x = 0
         self.android_y = 0
 
+        # ── Bug 2 Fix: Android device resolution (set dynamically via INIT handshake)
+        # Defaults are wide enough to avoid accidental boundary triggers before
+        # the real resolution arrives.  The Android client sends INIT:w:h on connect.
+        self._android_width = 1080
+        self._android_height = 2400
+
         # ── FIX: Use a threading.Event instead of a plain bool ──────────────
-        # Plain bool reads/writes are not atomic in CPython when accessed from
-        # two threads (listener thread + main/controller thread).  threading.Event
-        # provides a proper memory barrier.
         self._ignore_next_move = threading.Event()
 
         # Edge friction timing state variables
@@ -165,6 +168,19 @@ class MouseHookManager:
                 kb.update_suppression_state(value)
         except Exception as e:
             logger.error(f"Error notifying KeyboardHookManager: {e}")
+
+    # ── Android device resolution (dynamic via INIT handshake) ─────────────
+
+    def set_android_resolution(self, width: int, height: int):
+        """
+        Called when the Android client sends its real screen resolution via the
+        INIT:width:height TCP handshake packet.  Updates the virtual coordinate
+        clamps used by the Infinite Treadmill so they match the actual device.
+        """
+        with self.state_lock:
+            self._android_width = max(1, width)
+            self._android_height = max(1, height)
+        logger.info(f"Android virtual bounds updated to {width}x{height}")
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -329,9 +345,11 @@ class MouseHookManager:
 
             if dx != 0 or dy != 0:
                 with self.state_lock:
-                    # Clamp android virtual coordinates to device resolution
-                    self.android_x = max(-1, min(self.android_x + dx, 1080))
-                    self.android_y = max(0, min(self.android_y + dy, 2400))
+                    # ── Bug 2 Fix: clamp to REAL device resolution from INIT handshake
+                    aw = self._android_width
+                    ah = self._android_height
+                    self.android_x = max(-1, min(self.android_x + dx, aw))
+                    self.android_y = max(0, min(self.android_y + dy, ah))
                     virtual_x = self.android_x
 
                 # Virtual left-edge breach → release cursor back to PC

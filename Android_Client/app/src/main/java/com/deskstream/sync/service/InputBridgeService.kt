@@ -147,6 +147,13 @@ class InputBridgeService : Service() {
             }
         }
 
+        // ── Bug 2 Fix: forward INIT:w:h packet when AccessibilityService reports screen size ──
+        serviceScope.launch {
+            InputEventBus.initEvents.collect { (w, h) ->
+                client.sendInitPacket(w, h)
+            }
+        }
+
         client.start()
     }
 

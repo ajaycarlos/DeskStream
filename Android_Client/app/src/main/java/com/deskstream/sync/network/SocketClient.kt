@@ -182,23 +182,37 @@ class SocketClient(
      * Send UNLOCK message back to PC Host to release mouse trap bounds.
      */
     fun sendUnlockCommand() {
+        sendRawToHost("UNLOCK\n")
+    }
+
+    /**
+     * Send INIT:width:height to the PC Host so it can calibrate its virtual
+     * coordinate clamps to the real Android screen resolution.
+     */
+    fun sendInitPacket(width: Int, height: Int) {
+        sendRawToHost("INIT:$width:$height\n")
+        Log.d(TAG, "INIT packet sent: INIT:$width:$height")
+    }
+
+    /** Thread-safe raw write to the TCP output stream. */
+    private fun sendRawToHost(payload: String) {
         clientScope.launch(Dispatchers.IO) {
             try {
                 val output = tcpOutputStream
                 if (output != null) {
                     synchronized(output) {
-                        output.write("UNLOCK\n".toByteArray(Charsets.UTF_8))
+                        output.write(payload.toByteArray(Charsets.UTF_8))
                         output.flush()
                     }
-                    Log.d(TAG, "UNLOCK command successfully transmitted to PC Host.")
                 } else {
-                    Log.w(TAG, "Failed to send UNLOCK: Active TCP output stream is unavailable.")
+                    Log.w(TAG, "Cannot send '$payload': TCP output stream unavailable.")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to send UNLOCK command: ${e.message}")
+                Log.e(TAG, "Failed to send to host: ${e.message}")
             }
         }
     }
+
     
     /**
      * Parse raw string lines based on DeskStream KVM specification:

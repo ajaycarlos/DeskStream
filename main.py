@@ -28,10 +28,11 @@ class DeskStreamApp:
         self.settings = SettingsManager()
         self.gui_queue = queue.Queue()
         
-        # Initialize connection manager with unlock callback (from Android client)
+        # Initialize connection manager with unlock + device-info callbacks
         self.connection = ConnectionManager(
             self.settings,
-            on_unlock_callback=self._handle_unlock_request
+            on_unlock_callback=self._handle_unlock_request,
+            on_device_info_callback=self._handle_device_info
         )
         
         # Initialize keyboard tracker with text/action routing callback
@@ -76,6 +77,11 @@ class DeskStreamApp:
 
         # 3. Activate keyboard suppression and redirect keystrokes
         self.keyboard_hook.is_trapped = True
+
+    def _handle_device_info(self, width: int, height: int):
+        """Callback fired when the Android client sends its INIT resolution packet."""
+        logger.info(f"Android device resolution received: {width}x{height}. Updating treadmill clamps.")
+        self.mouse_hook.set_android_resolution(width, height)
 
     def _handle_mouse_move(self, dx, dy):
         """Callback fired to forward trapped mouse relative coordinates."""

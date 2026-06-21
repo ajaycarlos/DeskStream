@@ -11,10 +11,17 @@ class ConnectionManager:
     Orchestrates the dual connection layers (USB/ADB and Wi-Fi TCP/UDP).
     Handles ADB command execution and fail-safe recovery for USB connection states.
     """
-    def __init__(self, settings_manager, on_unlock_callback=None):
+    def __init__(self, settings_manager, on_unlock_callback=None,
+                 on_device_info_callback=None):
         self.settings = settings_manager
         self.on_unlock_callback = on_unlock_callback
-        self.tcp_server = TCPHostServer(settings_manager, on_unlock_callback=self._on_unlock_received)
+        # Called with (width, height) when the Android client sends its INIT packet
+        self.on_device_info_callback = on_device_info_callback
+        self.tcp_server = TCPHostServer(
+            settings_manager,
+            on_unlock_callback=self._on_unlock_received,
+            on_device_info_callback=self._on_device_info_received
+        )
         self.udp_sender = UDPMouseStreamer()
         self.is_streaming = False
         self.lock = threading.Lock()
@@ -27,11 +34,20 @@ class ConnectionManager:
             except Exception as e:
                 logger.error(f"Error processing unlock callback in ConnectionManager: {e}")
 
+    def _on_device_info_received(self, width: int, height: int):
+        """Forwards Android device screen dimensions to the registered callback."""
+        logger.info(f"Device info received: {width}x{height}")
+        if self.on_device_info_callback:
+            try:
+                self.on_device_info_callback(width, height)
+            except Exception as e:
+                logger.error(f"Error processing device info callback: {e}")
+
     def start_services(self):
         """Initializes TCP server listening pipelines."""
         mode = self.settings.get_connection_mode()
         devices = self.settings.get_saved_devices()
-        
+
         # Determine port - default to 8080
         port = 8080
         if devices:
@@ -40,19 +56,16 @@ class ConnectionManager:
         logger.info(f"Starting connection services in {mode} mode.")
 
         if mode == "USB":
-            # Attempt to set up ADB port forwarding
             self._setup_adb_tunnel(port)
-            # Bind TCP to localhost only for USB security
             self.tcp_server.start(port=port)
         else:
-            # Bind TCP to open interfaces for Wi-Fi pairing
             self.tcp_server.start(port=port)
 
     def stop_services(self):
         """Stops both TCP and UDP listening/sending layers."""
         self.stop_streaming()
-        self.tcp_server.stop()
-        
+        self.tcp_server.stop()   # ← now blocks until listener thread exits
+
         mode = self.settings.get_connection_mode()
         if mode == "USB":
             devices = self.settings.get_saved_devices()
@@ -61,13 +74,12 @@ class ConnectionManager:
 
     def _setup_adb_tunnel(self, port):
         """
-        Executes 'adb reverse' via subprocess to forward Android client requests
-        to the PC host's TCP server. Catches errors gracefully if phone is absent.
+        Executes 'adb reverse' to forward Android client requests to the PC host's
+        TCP server. Catches errors gracefully if phone is absent.
         """
         try:
             logger.info(f"Setting up ADB reverse tunnel: adb reverse tcp:{port} tcp:{port}")
-            # Run command to reverse port forwarding. If device is absent, this will return non-zero
-            result = subprocess.run(
+            subprocess.run(
                 ["adb", "reverse", f"tcp:{port}", f"tcp:{port}"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -78,7 +90,6 @@ class ConnectionManager:
         except FileNotFoundError:
             logger.error("ADB command not found on host. Please install android-tools-adb.")
         except subprocess.CalledProcessError as e:
-            # Device not connected or USB debugging disabled
             stderr_cleaned = e.stderr.strip().replace("\n", " ")
             logger.warning(
                 f"ADB Tunnel Configuration failed: {stderr_cleaned}. "
@@ -106,22 +117,20 @@ class ConnectionManager:
         with self.lock:
             if self.is_streaming:
                 return
-            
+
             mode = self.settings.get_connection_mode()
             devices = self.settings.get_saved_devices()
-            
+
             if mode == "WIFI":
                 if not devices:
                     logger.error("Cannot start Wi-Fi streaming: No paired device configured.")
                     return
-                
+
                 device = devices[0]
                 target_ip = device["last_known_ip"]
-                # Mouse updates go to target_port + 1 (UDP)
                 target_port = device["preferred_port"] + 1
-                
                 self.udp_sender.start(target_ip, target_port)
-            
+
             self.is_streaming = True
             logger.info(f"Data streaming activated ({mode} transport).")
 
@@ -130,7 +139,6 @@ class ConnectionManager:
         with self.lock:
             if not self.is_streaming:
                 return
-            
             self.udp_sender.stop()
             self.is_streaming = False
             logger.info("Data streaming deactivated.")
@@ -147,7 +155,6 @@ class ConnectionManager:
         if mode == "WIFI":
             self.udp_sender.send_mouse_delta(dx, dy)
         elif mode == "USB":
-            # For USB mode, we pipe mouse events directly over the reversed TCP control socket
             self.tcp_server.send_message(f"M:{dx}:{dy}")
 
     def send_mouse_click(self, button, state):
@@ -159,7 +166,6 @@ class ConnectionManager:
         if mode == "WIFI":
             self.udp_sender.send_mouse_click(button, state)
         elif mode == "USB":
-            # Sanitize button naming
             btn = str(button).upper()
             btn = "LEFT" if "LEFT" in btn else ("RIGHT" if "RIGHT" in btn else ("MIDDLE" if "MIDDLE" in btn else btn))
             self.tcp_server.send_message(f"C:{btn}:{state}")
@@ -167,9 +173,8 @@ class ConnectionManager:
     def send_mouse_scroll(self, dy: int):
         """
         Sends a scroll-wheel delta to the Android client.
-        dy > 0 means scroll down (page moves down), dy < 0 means scroll up.
-        Uses the 'S:dy' protocol token so it is unambiguously distinguished
-        from a mouse-move 'M:dx:dy' packet on the Android side.
+        dy > 0 means scroll down; dy < 0 means scroll up.
+        Uses the 'S:dy' protocol token distinct from 'M:dx:dy' move packets.
         """
         if not self.is_streaming:
             return
@@ -179,4 +184,3 @@ class ConnectionManager:
             self.udp_sender.send_raw(payload)
         elif mode == "USB":
             self.tcp_server.send_message(payload)
-
