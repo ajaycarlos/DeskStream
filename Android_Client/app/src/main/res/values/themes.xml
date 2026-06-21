@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base application theme inheriting from Material3. -->
+    <style name="Theme.DeskStreamSync" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Theme customization overrides go here -->
+    </style>
+</resources>

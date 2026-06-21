@@ -1,0 +1,12 @@
+{
+    "selected_edge": "RIGHT",
+    "edge_friction_ms": 150,
+    "connection_mode": "WIFI",
+    "saved_devices": [
+        {
+            "device_name": "Android Mobile Device",
+            "last_known_ip": "127.0.0.1",
+            "preferred_port": 8080
+        }
+    ]
+}

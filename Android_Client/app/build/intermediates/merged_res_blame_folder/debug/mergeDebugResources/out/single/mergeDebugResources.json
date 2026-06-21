@@ -1,0 +1,14 @@
+[
+    {
+        "merged": "com.deskstream.sync.app-debug-57:/xml_method.xml.flat",
+        "source": "com.deskstream.sync.app-main-59:/xml/method.xml"
+    },
+    {
+        "merged": "com.deskstream.sync.app-debug-57:/drawable_ic_mouse_cursor.xml.flat",
+        "source": "com.deskstream.sync.app-main-59:/drawable/ic_mouse_cursor.xml"
+    },
+    {
+        "merged": "com.deskstream.sync.app-debug-57:/xml_accessibility_service_config.xml.flat",
+        "source": "com.deskstream.sync.app-main-59:/xml/accessibility_service_config.xml"
+    }
+]
