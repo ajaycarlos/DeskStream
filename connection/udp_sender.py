@@ -77,3 +77,10 @@ class UDPMouseStreamer:
 
         payload = f"C:{btn}:{state}"
         self._send(payload)
+
+    def send_raw(self, payload: str):
+        """
+        Sends an arbitrary pre-formatted protocol payload string.
+        Use for protocol tokens (e.g. 'S:dy') that don't fit the move/click helpers.
+        """
+        self._send(payload)

@@ -116,6 +116,12 @@ class InputBridgeService : Service() {
             }
         }
 
+        client.onMouseScrollReceived = { dy ->
+            serviceScope.launch {
+                InputEventBus.emit(InputEvent.MouseScroll(dy))
+            }
+        }
+
         client.onKeyTextReceived = { text ->
             serviceScope.launch {
                 InputEventBus.emit(InputEvent.KeyText(text))

@@ -35,6 +35,8 @@ class SocketClient(
     // Callback handlers to expose events to the holding service
     var onMouseMoveReceived: ((dx: Int, dy: Int) -> Unit)? = null
     var onMouseClickReceived: ((button: String, state: Int) -> Unit)? = null
+    /** Invoked when a scroll-delta packet arrives (dy > 0 = scroll down). */
+    var onMouseScrollReceived: ((dy: Int) -> Unit)? = null
     var onKeyTextReceived: ((text: String) -> Unit)? = null
     var onKeyActionReceived: ((action: String) -> Unit)? = null
     var onConnectionStateChanged: ((state: ConnectionState, error: String?) -> Unit)? = null
@@ -235,6 +237,13 @@ class SocketClient(
                             "ACT" -> onKeyActionReceived?.invoke(content)
                             else -> Log.w(TAG, "Unknown keyboard subtype: $subType")
                         }
+                    }
+                }
+                // Scroll: S:dy  (dy > 0 = scroll down)
+                "S" -> {
+                    if (parts.size >= 2) {
+                        val dy = parts[1].toIntOrNull() ?: 0
+                        onMouseScrollReceived?.invoke(dy)
                     }
                 }
                 else -> {

@@ -15,7 +15,7 @@ class SettingsManager:
     DEFAULT_CONFIG = {
         "selected_edge": "RIGHT",
         "edge_friction_ms": 150,
-        "connection_mode": "WIFI",
+        "connection_mode": "USB",
         "saved_devices": [
             {
                 "device_name": "Android Mobile Device",

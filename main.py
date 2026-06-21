@@ -39,13 +39,18 @@ class DeskStreamApp:
             on_key_event_callback=self._handle_key_event
         )
 
-        # Initialize mouse tracker with callbacks for screen exit, movement deltas, and clicks
+        # Initialize mouse tracker with callbacks for screen exit, movement deltas, clicks, scroll, and unlock
         self.mouse_hook = MouseHookManager(
             self.settings,
             on_screen_exit_callback=self._handle_screen_exit,
             on_mouse_move_delta_callback=self._handle_mouse_move,
-            on_mouse_click_callback=self._handle_mouse_click
+            on_mouse_click_callback=self._handle_mouse_click,
+            on_mouse_scroll_callback=self._handle_mouse_scroll,
+            on_unlock_callback=self._handle_unlock_request
         )
+        
+        # Link keyboard hook to mouse hook for state dependency
+        self.keyboard_hook.mouse_hook = self.mouse_hook
 
         # Initialize system tray icon manager
         self.tray = TrayIconManager(
@@ -55,6 +60,9 @@ class DeskStreamApp:
         
         self.settings_window = None
         self.running = False
+
+        # Auto-launch settings configuration window on startup
+        self.gui_queue.put("SHOW_SETTINGS")
 
     def _handle_screen_exit(self, edge, trap_x, trap_y):
         """Callback fired when the mouse hits the configured screen boundary past the friction threshold."""
@@ -72,6 +80,10 @@ class DeskStreamApp:
     def _handle_mouse_move(self, dx, dy):
         """Callback fired to forward trapped mouse relative coordinates."""
         self.connection.send_mouse_delta(dx, dy)
+
+    def _handle_mouse_scroll(self, dy):
+        """Callback fired to forward scroll-wheel ticks over the wire."""
+        self.connection.send_mouse_scroll(dy)
 
     def _handle_mouse_click(self, button, state):
         """Callback fired to forward trapped mouse click states."""

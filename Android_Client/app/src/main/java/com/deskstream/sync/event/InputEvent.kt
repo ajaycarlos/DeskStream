@@ -8,6 +8,8 @@ import com.deskstream.sync.network.SocketClient
 sealed class InputEvent {
     data class MouseMove(val dx: Int, val dy: Int) : InputEvent()
     data class MouseClick(val button: String, val state: Int) : InputEvent()
+    /** Vertical scroll tick from the PC host. dy > 0 = scroll down. */
+    data class MouseScroll(val dy: Int) : InputEvent()
     data class KeyText(val text: String) : InputEvent()
     data class KeyAction(val action: String) : InputEvent()
     data class ConnectionStateChanged(

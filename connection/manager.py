@@ -163,3 +163,20 @@ class ConnectionManager:
             btn = str(button).upper()
             btn = "LEFT" if "LEFT" in btn else ("RIGHT" if "RIGHT" in btn else ("MIDDLE" if "MIDDLE" in btn else btn))
             self.tcp_server.send_message(f"C:{btn}:{state}")
+
+    def send_mouse_scroll(self, dy: int):
+        """
+        Sends a scroll-wheel delta to the Android client.
+        dy > 0 means scroll down (page moves down), dy < 0 means scroll up.
+        Uses the 'S:dy' protocol token so it is unambiguously distinguished
+        from a mouse-move 'M:dx:dy' packet on the Android side.
+        """
+        if not self.is_streaming:
+            return
+        mode = self.settings.get_connection_mode()
+        payload = f"S:{dy}"
+        if mode == "WIFI":
+            self.udp_sender.send_raw(payload)
+        elif mode == "USB":
+            self.tcp_server.send_message(payload)
+

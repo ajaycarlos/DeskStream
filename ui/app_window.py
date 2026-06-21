@@ -60,7 +60,7 @@ class ConfigWindow:
             variable=self.friction_var,
             command=self._on_slider_move
         )
-        self.friction_slider.grid(row=3, column=0, columnspan=2, pady=(0, 15), fill=tk.X)
+        self.friction_slider.grid(row=3, column=0, columnspan=2, pady=(0, 15), sticky="ew")
 
         # 3. Connection Mode Radios
         ttk.Label(main_frame, text="Connection Transport:").grid(row=4, column=0, pady=10, sticky=tk.W)
@@ -92,7 +92,7 @@ class ConfigWindow:
             text="Save & Apply Settings",
             command=self._on_save
         )
-        self.save_btn.grid(row=6, column=0, columnspan=2, pady=10, fill=tk.X)
+        self.save_btn.grid(row=6, column=0, columnspan=2, pady=10, sticky="ew")
 
         # Keep window on top for accessibility focus
         self.root.attributes("-topmost", True)
