@@ -16,6 +16,9 @@ class SettingsManager:
         "selected_edge": "RIGHT",
         "edge_friction_ms": 150,
         "connection_mode": "USB",
+        # Mouse sensitivity multiplier applied on top of the DPI-derived dpi_scale.
+        # Range [0.1, 3.0]; 1.0 = no additional scaling beyond DPI correction.
+        "mouse_sensitivity": 1.0,
         "saved_devices": [
             {
                 "device_name": "Android Mobile Device",
@@ -94,6 +97,9 @@ class SettingsManager:
         
         elif key == "edge_friction_ms":
             return isinstance(value, int) and 0 <= value <= 10000
+
+        elif key == "mouse_sensitivity":
+            return isinstance(value, (int, float)) and 0.1 <= float(value) <= 3.0
         
         elif key == "connection_mode":
             return value in ("WIFI", "USB")
@@ -134,6 +140,10 @@ class SettingsManager:
         with self.lock:
             return self.config.get("edge_friction_ms", 150)
 
+    def get_mouse_sensitivity(self) -> float:
+        with self.lock:
+            return float(self.config.get("mouse_sensitivity", 1.0))
+
     def get_connection_mode(self):
         with self.lock:
             return self.config.get("connection_mode", "WIFI")
@@ -155,6 +165,15 @@ class SettingsManager:
             raise ValueError("Invalid friction duration. Must be an int between 0 and 10000.")
         with self.lock:
             self.config["edge_friction_ms"] = ms
+            self._save_under_lock()
+
+    def set_mouse_sensitivity(self, value: float):
+        """Validates and persists the mouse sensitivity multiplier [0.1, 3.0]."""
+        value = float(value)
+        if not self._validate_field("mouse_sensitivity", value):
+            raise ValueError(f"Invalid sensitivity {value:.2f}. Must be between 0.1 and 3.0.")
+        with self.lock:
+            self.config["mouse_sensitivity"] = round(value, 2)
             self._save_under_lock()
 
     def set_connection_mode(self, mode):

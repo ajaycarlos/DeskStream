@@ -2,6 +2,7 @@
     "selected_edge": "RIGHT",
     "edge_friction_ms": 150,
     "connection_mode": "USB",
+    "mouse_sensitivity": 0.85,
     "saved_devices": [
         {
             "device_name": "Android Mobile Device",

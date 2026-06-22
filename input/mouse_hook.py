@@ -142,6 +142,13 @@ class MouseHookManager:
         # Scaled up by a default 1.3x speed boost factor to make the cursor feel slightly faster.
         self.dpi_scale = 1.3
 
+        # ── User-facing sensitivity multiplier ────────────────────────────────
+        # Applied on top of dpi_scale inside _on_move.  Kept separate so that
+        # set_android_resolution() (which rewrites dpi_scale on every reconnect)
+        # never silently resets the user's GUI preference.
+        # Initialized from persisted settings; updated live via set_sensitivity().
+        self.sensitivity_multiplier = self.settings.get_mouse_sensitivity()
+
         # ── Bug 3 Fix: Sub-pixel accumulator ─────────────────────────────────
         # When dpi_scale < 1.0, int(dx * dpi_scale) truncates the fractional
         # remainder every tick, losing up to 0.99 px per event.  At 200 Hz this
@@ -210,6 +217,19 @@ class MouseHookManager:
             logger.error(f"Error notifying KeyboardHookManager: {e}")
 
     # ── Android device resolution (dynamic via INIT handshake) ─────────────
+
+    def set_sensitivity(self, value: float):
+        """
+        Live-updates the user-facing sensitivity multiplier.
+        Thread-safe: acquires state_lock before mutating the field so _on_move
+        never reads a partially written float.
+
+        :param value: Desired multiplier. Clamped to [0.1, 3.0] for safety.
+        """
+        clamped = max(0.1, min(3.0, float(value)))
+        with self.state_lock:
+            self.sensitivity_multiplier = clamped
+        logger.debug(f"Mouse sensitivity_multiplier set to {clamped:.2f}")
 
     def set_android_resolution(self, width: int, height: int, density_dpi: int = 0):
         """
@@ -711,14 +731,15 @@ class MouseHookManager:
 
                 # ── Sub-pixel accumulator pipeline (pure linear scaling) ───────
                 # Pipeline per axis:
-                #   scaled  = raw_delta * dpi_scale       e.g. 10 × 3.33 = 33.3
-                #   int_out = int(accum + scaled)          e.g. 33
-                #   accum   = (accum + scaled) - int_out   e.g. 0.3 → next tick
-                # All reads/writes to _subpx_* and dpi_scale are under this lock,
-                # so set_android_resolution() cannot reset them between our read
-                # and write (the previous TOCTOU race condition).
-                self._subpx_x += raw_dx * self.dpi_scale
-                self._subpx_y += raw_dy * self.dpi_scale
+                #   effective = dpi_scale * sensitivity_multiplier
+                #   scaled    = raw_delta * effective       e.g. 10 × 3.33 × 1.5 = 49.9
+                #   int_out   = int(accum + scaled)         e.g. 49
+                #   accum     = (accum + scaled) - int_out   e.g. 0.9 → next tick
+                # sensitivity_multiplier is read under this same lock so it is
+                # always coherent with dpi_scale in the same snapshot.
+                effective_scale = self.dpi_scale * self.sensitivity_multiplier
+                self._subpx_x += raw_dx * effective_scale
+                self._subpx_y += raw_dy * effective_scale
                 dx = int(self._subpx_x)
                 dy = int(self._subpx_y)
                 self._subpx_x -= dx

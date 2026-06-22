@@ -243,7 +243,8 @@ def main():
                     if app.settings_window is None or app.settings_window.is_closed:
                         app.settings_window = ConfigWindow(
                             app.settings,
-                            on_save_callback=app._on_settings_saved
+                            on_save_callback=app._on_settings_saved,
+                            mouse_hook_manager=app.mouse_hook
                         )
                     else:
                         app.settings_window.focus()
