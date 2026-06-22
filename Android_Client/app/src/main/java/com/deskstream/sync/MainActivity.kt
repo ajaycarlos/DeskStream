@@ -37,6 +37,8 @@ import com.deskstream.sync.network.SocketClient
 import com.deskstream.sync.service.InputBridgeService
 import com.deskstream.sync.service.KeyboardInjectionService
 import com.deskstream.sync.service.MouseAccessibilityService
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -65,6 +67,7 @@ class MainActivity : ComponentActivity() {
 fun KvmDashboard() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val coroutineScope = rememberCoroutineScope()
 
     // 1. Permission status states
     var isAccessibilityEnabled by remember { mutableStateOf(false) }
@@ -376,6 +379,18 @@ fun KvmDashboard() {
                         } else {
                             val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
                             imm.showInputMethodPicker()
+                            // ── Bug 3 Fix: bounded polling tied strictly to this picker interaction ──
+                            // The system dialog is a transparent overlay so the Activity never pauses
+                            // (no ON_PAUSE/ON_RESUME fires). We poll the raw Settings DB for up to
+                            // 15 s and break the moment the user confirms their selection, keeping
+                            // the check completely isolated to this user action window.
+                            coroutineScope.launch {
+                                repeat(30) { // 30 × 500ms = 15 seconds max
+                                    delay(500)
+                                    updatePermissionStatuses()
+                                    if (isImeSelected) return@launch // early exit
+                                }
+                            }
                         }
                     }
                 )
@@ -392,10 +407,21 @@ fun KvmDashboard() {
                     isServiceRunning = false
                     socketState = SocketClient.ConnectionState.DISCONNECTED
                     lastError = null
-                    
+
                     // Prompt user to switch back to their normal keyboard
                     val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
                     imm.showInputMethodPicker()
+                    // ── Bug 3 (Stop path): same bounded polling as "Set Default" ──
+                    // The IME picker is a transparent overlay — the Activity never pauses,
+                    // so ON_RESUME never fires. Poll for up to 15 s and exit early the
+                    // moment the user selects a different keyboard (isImeSelected → false).
+                    coroutineScope.launch {
+                        repeat(30) { // 30 × 500ms = 15 seconds max
+                            delay(500)
+                            updatePermissionStatuses()
+                            if (!isImeSelected) return@launch // early exit: our IME is no longer default
+                        }
+                    }
                 } else {
                     lastError = null
                     InputBridgeService.startService(
@@ -510,14 +536,13 @@ fun isAccessibilityServiceEnabled(context: Context, serviceClass: Class<out Acce
 }
 
 fun isImeEnabled(context: Context, servicePackage: String, serviceClass: String): Boolean {
-    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-    val enabledImes = imm.enabledInputMethodList ?: return false
-    for (ime in enabledImes) {
-        if (ime.packageName == servicePackage && ime.serviceInfo.name == serviceClass) {
-            return true
-        }
-    }
-    return false
+    val enabledImes = Settings.Secure.getString(
+        context.contentResolver,
+        Settings.Secure.ENABLED_INPUT_METHODS
+    ) ?: return false
+
+    val targetImeId = ComponentName(servicePackage, serviceClass).flattenToShortString()
+    return enabledImes.contains(targetImeId)
 }
 
 fun isImeSelected(context: Context, servicePackage: String, serviceClass: String): Boolean {
