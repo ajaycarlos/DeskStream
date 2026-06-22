@@ -99,7 +99,10 @@ class SocketClient(
                 Log.d(TAG, "Connecting to TCP host at $targetIp:$port")
                 
                 val socket = Socket(targetIp, port)
-                socket.soTimeout = 15000 // 15-second read timeout for keep-alive validation
+                // Raised from 15 s → 35 s.
+                // The Python host sends a PING every 5 s, so this timeout is now a
+                // genuine dead-connection guard rather than an idle-disconnect trigger.
+                socket.soTimeout = 35000
                 
                 tcpSocket = socket
                 tcpOutputStream = socket.getOutputStream()
@@ -178,6 +181,14 @@ class SocketClient(
         }
     }
     
+    /**
+     * Send PONG reply to the PC Host in response to a PING heartbeat.
+     * Keeps the TCP socket alive during user-idle periods.
+     */
+    private fun sendPong() {
+        sendRawToHost("PONG\n")
+    }
+
     /**
      * Send UNLOCK message back to PC Host to release mouse trap bounds.
      */
@@ -259,6 +270,12 @@ class SocketClient(
                         val dy = parts[1].toIntOrNull() ?: 0
                         onMouseScrollReceived?.invoke(dy)
                     }
+                }
+                // Application-level heartbeat from Python host.
+                // Reply with PONG so the host can validate round-trip liveness.
+                "PING" -> {
+                    Log.v(TAG, "Heartbeat PING received → sending PONG")
+                    sendPong()
                 }
                 else -> {
                     Log.d(TAG, "Unknown payload type received: $message")

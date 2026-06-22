@@ -38,6 +38,7 @@ class TCPHostServer:
         self.client_sock = None
         self.client_addr = None
         self.listener_thread = None
+        self.heartbeat_thread = None   # sends PING every 5 s while a client is connected
         self.is_running = False
         self.lock = threading.Lock()
 
@@ -78,6 +79,10 @@ class TCPHostServer:
                     logger.debug(f"Error closing client socket: {e}")
                 self.client_sock = None
                 self.client_addr = None
+
+            # Stop the heartbeat daemon thread
+            if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+                self.heartbeat_thread = None  # thread reads is_running; already False above
 
             # Close main server socket – this unblocks the accept() call
             if self.server_sock:
@@ -177,6 +182,17 @@ class TCPHostServer:
                     args=(client_sock, client_addr),
                     daemon=True
                 ).start()
+
+                # ── Heartbeat: start / restart the PING sender daemon ─────────────
+                hb = threading.Thread(
+                    target=self._heartbeat_loop,
+                    args=(client_sock,),
+                    daemon=True,
+                    name="deskstream-heartbeat"
+                )
+                hb.start()
+                with self.lock:
+                    self.heartbeat_thread = hb
             else:
                 try:
                     client_sock.close()
@@ -192,8 +208,44 @@ class TCPHostServer:
                     pass
                 self.server_sock = None
 
+    def _heartbeat_loop(self, client_sock):
+        """
+        Sends a lightweight 'PING\\n' packet to the connected Android client every
+        5 seconds.  This prevents the Android socket's read timeout from firing
+        during user-idle periods (e.g. no mouse/keyboard activity).
+
+        The thread exits as soon as:
+        - The server stops (is_running becomes False), or
+        - The provided client_sock is no longer the active session socket
+          (meaning the client disconnected and a new session may have started).
+        """
+        PING_INTERVAL = 5.0  # seconds between PING packets
+        logger.debug("Heartbeat loop started.")
+        while True:
+            # Sleep in short increments so stop() wakes us quickly
+            for _ in range(int(PING_INTERVAL / 0.5)):
+                time.sleep(0.5)
+                with self.lock:
+                    if not self.is_running or self.client_sock is not client_sock:
+                        logger.debug("Heartbeat loop exiting.")
+                        return
+
+            with self.lock:
+                sock = self.client_sock if self.client_sock is client_sock else None
+
+            if sock is None:
+                logger.debug("Heartbeat loop exiting: client changed.")
+                return
+
+            try:
+                sock.sendall(b"PING\n")
+                logger.debug("Heartbeat PING sent.")
+            except Exception as e:
+                logger.debug(f"Heartbeat send failed (client likely gone): {e}")
+                return
+
     def _handle_client(self, client_sock, client_addr):
-        """Receives incoming data from the client (INIT handshake, UNLOCK, heartbeats)."""
+        """Receives incoming data from the client (INIT handshake, UNLOCK, PONG heartbeats)."""
         client_ip = client_addr[0]
         buf = ""
         try:
@@ -262,6 +314,10 @@ class TCPHostServer:
                         self.on_device_info_callback(w, h, 0)
             except Exception as e:
                 logger.error(f"Failed to parse INIT packet '{msg}': {e}")
+
+        elif msg == "PONG":
+            # Heartbeat round-trip reply from Android; consume silently.
+            logger.debug(f"Heartbeat PONG received from {client_ip}.")
 
         else:
             logger.debug(f"Unknown message from client: {msg}")
