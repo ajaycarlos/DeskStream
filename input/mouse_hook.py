@@ -207,7 +207,7 @@ class MouseHookManager:
         INIT:width:height:densityDpi TCP handshake packet. Updates the virtual coordinate
         clamps and the dynamic DPI scaling multiplier used by the Infinite Treadmill.
 
-        DPI SCALE MATH (BUG 1 FIX):
+        DPI SCALE MATH:
           The PC mouse generates deltas in 96-DPI logical pixels (1 raw pixel = 1/96 inch).
           The Android screen has `density_dpi` physical pixels per inch.
           To make 1 inch of physical mouse travel move 1 inch on the Android glass, MULTIPLY:
@@ -217,58 +217,114 @@ class MouseHookManager:
           Example – Redmi 9i (320 DPI): dpi_scale = 320 / 96 ≈ 3.33
             → 1 raw PC delta pixel → 3.33 Android pixels  (correct, same physical travel)
 
-          The old (broken) formula was  96 / density_dpi = 0.3, which REDUCED the delta,
-          forcing the user to swipe 10× farther to cross the screen.
+        RECONNECT SESSION BOUNDARY – "TOTAL BRAIN WIPE":
+          Every INIT call is an unconditional session boundary.  Whether the previous
+          session ended cleanly or via an abrupt TCP drop, this method resets the
+          *complete* treadmill state before applying the new DPI math:
 
-        BUG 3 FIX – TCP Reconnect DPI/Speed Explosion:
-          On a TCP drop + reconnect the Android client re-sends INIT before any input
-          events.  However, if the previous session ended with an unclean disconnect
-          (i.e. the cursor was still trapped on Android), cursor_on_android is still
-          True and the treadmill is still active with stale android_x/y accumulators.
-          The very first move event after reconnect uses the *old* dpi_scale (if INIT
-          hasn't propagated yet) and stale sub-pixel remainders from the previous
-          session, producing an enormous synthetic delta and the "violently fast"
-          cursor symptom.
+          1. cursor_on_android → False: The treadmill is disarmed immediately under the
+             state_lock so _on_move() cannot race through the accumulator pipeline
+             with stale values after the lock is released.
+          2. _keyboard_focused_on_android → False: keyboard suppression is released.
+          3. android_x / android_y → 0: virtual position wiped.
+          4. _subpx_x / _subpx_y → 0.0: fractional accumulator flushed.
+          5. _cancel_friction_timer_under_lock(): any pending edge-friction is cancelled.
+          6. _ignore_next_move is armed AFTER the lock so the first post-INIT move
+             event (which may carry a stale pre-teleport X11 delta) is discarded.
+          7. The secondary suppress listener is torn down OUTSIDE the lock to avoid
+             deadlock (it acquires _suppress_lock internally).
+          8. Keyboard suppression is released via KeyboardHookManager OUTSIDE the
+             state_lock to avoid cross-lock ordering issues.
 
-          Remediation – every INIT call is a session boundary; reset ALL treadmill
-          state unconditionally:
-            - android_x / android_y: reset virtual position to centre (0, 0).
-            - _subpx_x / _subpx_y: flush stale fractional remainder.
-            - _ignore_next_move: arm the ignore flag so the FIRST real move event
-              after reconnect (which may still carry a pre-teleport stale delta)
-              is discarded safely.
+          This makes INIT idempotent and safe to call on every reconnect, whether or
+          not the previous session ended cleanly.
         """
+        # ── Step 1-5: atomically disarm the treadmill and apply new DPI math ──────────
+        was_trapped = False
         with self.state_lock:
             self._android_width = max(1, width)
             self._android_height = max(1, height)
-            # Apply a 1.3x speed boost factor so the cursor is slightly faster and feels snappier.
+
+            # Apply a 1.3x speed boost factor so the cursor feels snappier.
             speed_multiplier = 1.3
             if density_dpi > 0:
-                # ── BUG 1 FIX: was `96.0 / density_dpi` (reduction). Now multiply. ──
                 self.dpi_scale = (density_dpi / 96.0) * speed_multiplier
             else:
-                # No DPI info from handshake: use identity (1.0) * speed_multiplier.
+                # No DPI info from handshake: use identity * speed_multiplier.
                 self.dpi_scale = speed_multiplier
 
-            # ── BUG 3 FIX: full treadmill state reset on every TCP reconnect ────────────
-            # Reset virtual android position so the next session starts from (0, 0).
+            # Full treadmill state wipe – covers both clean and dirty disconnects.
+            if self.cursor_on_android:
+                was_trapped = True          # remember so we can clean up outside lock
+                self.cursor_on_android = False
+            self._keyboard_focused_on_android = False
             self.android_x = 0
             self.android_y = 0
-            # Flush any stale sub-pixel fractional remainder from the previous session.
             self._subpx_x = 0.0
             self._subpx_y = 0.0
+            # Cancel any pending edge-friction timers from the previous session.
+            self._cancel_friction_timer_under_lock()
 
-        # Arm the ignore flag OUTSIDE the lock (threading.Event is thread-safe).
-        # This absorbs the first post-reconnect move event which may carry a large
-        # stale pre-teleport delta even if the _on_move jitter guard normally
-        # handles it — belt-and-suspenders safety on the reconnect boundary.
+        # ── Step 6: arm ignore flag (threading.Event is lock-free) ───────────────────
+        # Absorbs the first post-INIT X11 move event which may carry a large
+        # stale pre-teleport delta (belt-and-suspenders on top of the jitter guard).
         self._ignore_next_move.set()
+
+        # ── Steps 7-8: teardown outside state_lock to avoid deadlock ─────────────────
+        if was_trapped:
+            # Stop the click/scroll suppression listener that was started by trap_cursor().
+            self._stop_suppress_listener()
+            # Release keyboard suppression via KeyboardHookManager.
+            try:
+                from input.keyboard_hook import KeyboardHookManager
+                kb = KeyboardHookManager.active_instance
+                if kb:
+                    kb.update_suppression_state(False)
+            except Exception as e:
+                logger.error(f"set_android_resolution: error releasing keyboard suppression: {e}")
+            logger.info("set_android_resolution: cursor was trapped — suppress listeners torn down.")
 
         logger.info(
             f"Android virtual bounds updated to {width}x{height}, DPI {density_dpi} "
-            f"(dpi_scale = {self.dpi_scale:.3f}  [= {density_dpi}/96]). "
-            f"Treadmill state fully reset for new session."
+            f"(dpi_scale = {self.dpi_scale:.3f}). "
+            f"Full session state wiped (was_trapped={was_trapped})."
         )
+
+    def on_client_disconnect(self):
+        """
+        Called by the TCP server layer whenever the Android client socket drops
+        (graceful close OR network error).  This is the authoritative hook for
+        cleaning up treadmill state on an unclean disconnect — i.e. the case where
+        the client vanishes without sending an UNLOCK command first.
+
+        WHY THIS EXISTS:
+          Without this hook, cursor_on_android stays True after a TCP drop.  The
+          pynput listener keeps running the treadmill loop (centre-teleport every
+          _on_move tick), accumulating stale deltas that are never forwarded.
+          When the client reconnects and sends INIT, set_android_resolution() wipes
+          the accumulators — but between the drop and the INIT there is a window
+          of hundreds of milliseconds where stale phantom motion can corrupt state.
+          Calling on_client_disconnect() immediately on drop closes that window.
+
+        IMPLEMENTATION:
+          Delegates to untrap_cursor() so the full teardown path (suppress listener,
+          keyboard hook notification, state reset) runs exactly once through the
+          canonical code path, with no duplication.
+        """
+        logger.info("on_client_disconnect: TCP client dropped — forcing cursor untrap.")
+        # Only untrap if we were actually trapped; untrap_cursor() is idempotent.
+        with self.state_lock:
+            is_trapped = self.cursor_on_android
+        if is_trapped:
+            self.untrap_cursor()
+            # Notify the unlock callback so streaming is stopped in main.py
+            if self.on_unlock_callback:
+                try:
+                    self.on_unlock_callback()
+                except Exception as e:
+                    logger.error(f"on_client_disconnect: error in on_unlock_callback: {e}")
+        else:
+            logger.debug("on_client_disconnect: cursor was not trapped, no-op.")
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -483,74 +539,90 @@ class MouseHookManager:
     # ── pynput callbacks ─────────────────────────────────────────────────────
 
     def _on_move(self, x, y):
-        """Global mouse move event callback (called on pynput's listener thread)."""
-        # ── FIX: use threading.Event.is_set() + clear() atomically ──────────
+        """
+        Global mouse move event callback (called on pynput's listener thread).
+
+        THREAD-SAFETY ARCHITECTURE:
+          All mutable treadmill state (cursor_on_android, center coords, dpi_scale,
+          android dimensions, android_x/y, _subpx_x/_subpx_y) is read and written
+          inside a SINGLE unified `with self.state_lock` block.  This eliminates the
+          previous TOCTOU race where:
+            - Block 1 read cursor_on_android + cx/cy
+            - Block 2 read _screen_width/_screen_height  (separate acquire/release)
+            - Block 3 read dpi_scale + accumulate _subpx_x/y  (separate acquire/release)
+            - Block 4 read aw/ah + update android_x/y  (separate acquire/release)
+          Between each pair of lock releases, the TCP thread could call
+          set_android_resolution() and mutate dpi_scale, _subpx_*, or android_*,
+          producing a mixed-state snapshot that caused the speed explosion.
+
+          The unified block reads cursor_on_android, and if False, exits immediately —
+          so the overhead on the non-trapped hot path is a single fast lock+read+unlock.
+
+          X11 I/O (mouse_controller.position) is still performed OUTSIDE the lock,
+          as blocking I/O under a mutex is forbidden by the design contract.
+        """
+        # ── Single-shot ignore gate (threading.Event is lock-free) ────────────────────
         if self._ignore_next_move.is_set():
             self._ignore_next_move.clear()
             return
 
+        # ── Unified atomic state snapshot + accumulator pipeline ──────────────────────
+        # All state reads and writes happen inside ONE lock acquisition.
+        # This is the critical fix: cursor_on_android, dpi_scale, _subpx_*,
+        # android_x/y are all read from a single coherent snapshot, so a concurrent
+        # set_android_resolution() or on_client_disconnect() cannot interleave and
+        # create a mixed-generation state (old dpi_scale + reset accumulator, etc.).
+        dx = 0
+        dy = 0
+        cx = 0
+        cy = 0
+        virtual_x = 0
+        should_forward = False
+        should_escape = False
+
         with self.state_lock:
             cursor_on_android = self.cursor_on_android
-            cx = self.center_x
-            cy = self.center_y
+            if not cursor_on_android:
+                # Not trapped — fall through to edge detection below.
+                sw = self._screen_width
+                sh = self._screen_height
+            else:
+                cx = self.center_x
+                cy = self.center_y
+                raw_dx = x - cx
+                raw_dy = y - cy
 
-        if cursor_on_android:
-            raw_dx = x - cx
-            raw_dy = y - cy
-
-            # ── Teleport-jitter guard ─────────────────────────────────────────
-            # When trap_cursor() teleports the physical cursor from the screen
-            # edge (e.g. x=1919) to the centre (e.g. x=960), X11 is async.
-            # pynput may fire 1–3 more move events with the OLD pre-teleport
-            # coordinates before the OS catches up.  _ignore_next_move is
-            # single-shot, so only the FIRST of these is absorbed.  The
-            # remaining events see raw_dx = 1919 - 960 = 959, which at
-            # dpi_scale ≈ 4.33 becomes 4152 Android pixels in one tick —
-            # the "violently fast on re-entry" bug.
-            #
-            # Guard: any single-tick delta exceeding half the screen dimension
-            # is physically impossible from real mouse hardware (a 1000-DPI
-            # mouse at 500 Hz can produce at most ~30px per event at sprint
-            # speed). Values this large are always stale pre-teleport jitter.
-            # We discard them and re-arm the ignore flag for the next event.
-            with self.state_lock:
+                # ── Teleport-jitter guard ─────────────────────────────────────
+                # When trap_cursor() teleports the physical cursor from the screen
+                # edge (e.g. x=1919) to the centre (e.g. x=960), X11 is async.
+                # pynput may fire 1–3 more move events with the OLD pre-teleport
+                # coordinates before the OS catches up.  _ignore_next_move is
+                # single-shot so only the FIRST is absorbed by the gate above.
+                # Remaining phantom events see raw_dx = edge - centre ≈ ±960 px,
+                # which at dpi_scale ≈ 3.33 becomes ~3200 Android pixels — the
+                # "violently fast" symptom.  Guard: any delta exceeding half the
+                # screen is physically impossible from real hardware and is jitter.
                 _sw = self._screen_width
                 _sh = self._screen_height
-            if abs(raw_dx) > _sw // 2 or abs(raw_dy) > _sh // 2:
-                logger.debug(
-                    f"_on_move: discarding teleport-jitter event "
-                    f"(raw_dx={raw_dx}, raw_dy={raw_dy}). Re-arming ignore flag."
-                )
-                self._ignore_next_move.set()
-                return
+                if abs(raw_dx) > _sw // 2 or abs(raw_dy) > _sh // 2:
+                    # Discard jitter and re-arm the ignore gate for the next event.
+                    # We must release the lock before calling .set() (Event is
+                    # lock-free, but we keep the pattern consistent).
+                    logger.debug(
+                        f"_on_move: discarding teleport-jitter event "
+                        f"(raw_dx={raw_dx}, raw_dy={raw_dy}). Re-arming ignore flag."
+                    )
+                    self._ignore_next_move.set()
+                    return  # exits the `with` block cleanly
 
-            # ── Movement pipeline: pure linear scaling + sub-pixel accumulator ──
-            #
-            # WHY NO EASING CURVE:
-            # A sqrt easing function has output/input ratio = 1/sqrt(|v|).
-            # At raw_dx=16 that ratio is 25% — it silently discards 75% of all
-            # fast-swipe velocity, making the cursor feel extremely sluggish.
-            # Easing was only useful when dpi_scale < 1.0 (old inverted formula)
-            # to avoid sub-pixel events rounding to zero.  With dpi_scale = 3.33
-            # (Redmi 9i), even a 1-pixel raw delta maps to 3.33 Android pixels —
-            # the accumulator alone handles sub-pixel precision perfectly.
-            #
-            # Pipeline (per axis):
-            #   scaled  = raw_delta * dpi_scale      (e.g. 10 × 3.33 = 33.3)
-            #   int_out = int(accum + scaled)         (e.g. 33)
-            #   accum   = (accum + scaled) - int_out  (e.g. 0.3, kept for next tick)
-            #
-            # This achieves 1:1 physical-to-virtual travel distance while
-            # preserving sub-pixel precision with zero velocity loss.
-            #
-            # BUG 3 FIX – accumulator race:
-            # _subpx_x/_subpx_y are read AND written here on the pynput listener
-            # thread.  set_android_resolution() resets them under state_lock from
-            # a different thread (the TCP receive thread).  We must hold state_lock
-            # around the entire read-accumulate-write cycle to prevent a TOCTOU
-            # race where set_android_resolution() clears the accumulator between
-            # our read and write, causing a stale value to survive the reset.
-            with self.state_lock:
+                # ── Sub-pixel accumulator pipeline (pure linear scaling) ───────
+                # Pipeline per axis:
+                #   scaled  = raw_delta * dpi_scale       e.g. 10 × 3.33 = 33.3
+                #   int_out = int(accum + scaled)          e.g. 33
+                #   accum   = (accum + scaled) - int_out   e.g. 0.3 → next tick
+                # All reads/writes to _subpx_* and dpi_scale are under this lock,
+                # so set_android_resolution() cannot reset them between our read
+                # and write (the previous TOCTOU race condition).
                 self._subpx_x += raw_dx * self.dpi_scale
                 self._subpx_y += raw_dy * self.dpi_scale
                 dx = int(self._subpx_x)
@@ -558,49 +630,75 @@ class MouseHookManager:
                 self._subpx_x -= dx
                 self._subpx_y -= dy
 
-            if dx != 0 or dy != 0:
-                with self.state_lock:
-                    # ── Bug 2 Fix: clamp to REAL device resolution from INIT handshake
+                if dx != 0 or dy != 0:
+                    # ── Virtual coordinate clamping + escape detection ──────────
+                    # Clamp to real device resolution received via INIT handshake.
+                    # Allow android_x to go as negative as -(ESCAPE_BUFFER_PX+1)
+                    # before treating it as a deliberate escape swipe — prevents
+                    # natural sensor jitter (~±3px) from firing an accidental unlock.
                     aw = self._android_width
                     ah = self._android_height
-                    # ── Bug 5 Fix: allow android_x to go as negative as
-                    # -ESCAPE_BUFFER_PX before treating it as an escape.
-                    # This prevents sensor jitter from firing the unlock.
                     self.android_x = max(-(ESCAPE_BUFFER_PX + 1),
                                          min(self.android_x + dx, aw))
                     self.android_y = max(0, min(self.android_y + dy, ah))
                     virtual_x = self.android_x
 
-                # ── Bug 5 Fix: require deliberate leftward swipe (> ESCAPE_BUFFER_PX)
-                # Natural jitter at x≈0 produces deltas of ±1–5px at most, which
-                # will nudge android_x to -1..-5 — well within the buffer zone.
-                # Only a sustained swipe accumulating > 30px of leftward virtual
-                # movement triggers the escape.
-                if virtual_x <= -ESCAPE_BUFFER_PX:
-                    logger.info(
-                        f"Virtual boundary breached (android_x={virtual_x} ≤ "
-                        f"-{ESCAPE_BUFFER_PX}). Unlocking cursor."
-                    )
-                    self.untrap_cursor()
-                    if self.on_unlock_callback:
-                        try:
-                            self.on_unlock_callback()
-                        except Exception as e:
-                            logger.error(f"Error executing on_unlock_callback: {e}")
-                    return
+                    if virtual_x <= -ESCAPE_BUFFER_PX:
+                        should_escape = True
+                    else:
+                        should_forward = True
+        # ── End of unified lock block ─────────────────────────────────────────────────
 
-                # Forward delta to Android client
-                if self.on_mouse_move_delta_callback:
-                    try:
-                        self.on_mouse_move_delta_callback(dx, dy)
-                    except Exception as e:
-                        logger.error(f"Error in mouse move delta callback: {e}")
-
-                # ── FIX: set flag BEFORE teleporting ─────────────────────────
-                self._ignore_next_move.set()
-                # Outside the state_lock – X11 I/O must not be under a lock
-                self.mouse_controller.position = (cx, cy)
+        if not cursor_on_android:
+            # ── Normal (non-trapped) edge detection ──────────────────────────
+            is_hit, edge = self._check_edge(x, y)
+            if is_hit:
+                with self.state_lock:
+                    if not self.at_edge:
+                        self.at_edge = True
+                        friction_ms = self.settings.get_edge_friction_ms()
+                        logger.debug(f"Mouse reached boundary ({edge} edge). "
+                                     f"Starting friction timer for {friction_ms}ms.")
+                        self.friction_timer = threading.Timer(
+                            friction_ms / 1000.0,
+                            self._on_friction_timer_fired,
+                            args=[edge, x, y]
+                        )
+                        self.friction_timer.start()
+            else:
+                with self.state_lock:
+                    if self.at_edge:
+                        logger.debug(f"Mouse moved away from {edge} edge. Cancelling friction timer.")
+                        self._cancel_friction_timer_under_lock()
             return
+
+        # ── Treadmill mode: process the outcome flags set inside the lock ──────────────
+        if should_escape:
+            logger.info(
+                f"Virtual boundary breached (android_x={virtual_x} ≤ "
+                f"-{ESCAPE_BUFFER_PX}). Unlocking cursor."
+            )
+            self.untrap_cursor()
+            if self.on_unlock_callback:
+                try:
+                    self.on_unlock_callback()
+                except Exception as e:
+                    logger.error(f"Error executing on_unlock_callback: {e}")
+            return
+
+        if should_forward:
+            # Forward delta to Android client
+            if self.on_mouse_move_delta_callback:
+                try:
+                    self.on_mouse_move_delta_callback(dx, dy)
+                except Exception as e:
+                    logger.error(f"Error in mouse move delta callback: {e}")
+
+            # Arm ignore flag BEFORE teleporting so the resulting X11 move event
+            # (triggered by mouse_controller.position assignment below) is swallowed.
+            self._ignore_next_move.set()
+            # X11 I/O outside the lock — blocking calls under a mutex are forbidden.
+            self.mouse_controller.position = (cx, cy)
 
         # ── Normal (non-trapped) edge detection ──────────────────────────────
         # Read dimensions without the lock to keep the hot path lean

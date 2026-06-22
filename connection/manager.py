@@ -12,15 +12,18 @@ class ConnectionManager:
     Handles ADB command execution and fail-safe recovery for USB connection states.
     """
     def __init__(self, settings_manager, on_unlock_callback=None,
-                 on_device_info_callback=None):
+                 on_device_info_callback=None, on_client_disconnect_callback=None):
         self.settings = settings_manager
         self.on_unlock_callback = on_unlock_callback
         # Called with (width, height) when the Android client sends its INIT packet
         self.on_device_info_callback = on_device_info_callback
+        # Called with no args when the Android TCP client socket drops
+        self.on_client_disconnect_callback = on_client_disconnect_callback
         self.tcp_server = TCPHostServer(
             settings_manager,
             on_unlock_callback=self._on_unlock_received,
-            on_device_info_callback=self._on_device_info_received
+            on_device_info_callback=self._on_device_info_received,
+            on_client_disconnect_callback=self._on_client_disconnected
         )
         self.udp_sender = UDPMouseStreamer()
         self.is_streaming = False
@@ -33,6 +36,15 @@ class ConnectionManager:
                 self.on_unlock_callback()
             except Exception as e:
                 logger.error(f"Error processing unlock callback in ConnectionManager: {e}")
+
+    def _on_client_disconnected(self):
+        """Relays TCP client drop event to the mouse hook for immediate treadmill teardown."""
+        logger.info("ConnectionManager: TCP client disconnected — relaying to mouse hook.")
+        if self.on_client_disconnect_callback:
+            try:
+                self.on_client_disconnect_callback()
+            except Exception as e:
+                logger.error(f"Error processing client disconnect callback: {e}")
 
     def _on_device_info_received(self, width: int, height: int, density_dpi: int = 0):
         """Forwards Android device screen dimensions and DPI to the registered callback."""

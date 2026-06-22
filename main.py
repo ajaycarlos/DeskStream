@@ -28,11 +28,12 @@ class DeskStreamApp:
         self.settings = SettingsManager()
         self.gui_queue = queue.Queue()
         
-        # Initialize connection manager with unlock + device-info callbacks
+        # Initialize connection manager with unlock + device-info + disconnect callbacks
         self.connection = ConnectionManager(
             self.settings,
             on_unlock_callback=self._handle_unlock_request,
-            on_device_info_callback=self._handle_device_info
+            on_device_info_callback=self._handle_device_info,
+            on_client_disconnect_callback=self._handle_client_disconnect
         )
         
         # Initialize keyboard tracker with text/action routing callback
@@ -84,6 +85,19 @@ class DeskStreamApp:
         """Callback fired when the Android client sends its INIT resolution packet."""
         logger.info(f"Android device resolution received: {width}x{height}, DPI {density_dpi}. Updating treadmill clamps.")
         self.mouse_hook.set_android_resolution(width, height, density_dpi)
+
+    def _handle_client_disconnect(self):
+        """
+        Callback fired immediately when the Android client TCP socket drops
+        (graceful OR abrupt).  Delegates to mouse_hook.on_client_disconnect()
+        which untraps the cursor and stops streaming if it was active.
+
+        This fires BEFORE the next INIT handshake, closing the window where
+        cursor_on_android would otherwise stay True with a live treadmill and
+        stale velocity accumulators — the root cause of the reconnect speed explosion.
+        """
+        logger.info("TCP client disconnected. Delegating teardown to mouse hook.")
+        self.mouse_hook.on_client_disconnect()
 
     def _handle_mouse_move(self, dx, dy):
         """Callback fired to forward trapped mouse relative coordinates."""

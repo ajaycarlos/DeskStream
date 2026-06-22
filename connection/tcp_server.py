@@ -29,11 +29,13 @@ class TCPHostServer:
     accept() loop cleanly.
     """
     def __init__(self, settings_manager, on_unlock_callback=None,
-                 on_device_info_callback=None):
+                 on_device_info_callback=None, on_client_disconnect_callback=None):
         self.settings = settings_manager
         self.on_unlock_callback = on_unlock_callback
         # Called with (width: int, height: int) when Android sends INIT packet
         self.on_device_info_callback = on_device_info_callback
+        # Called with no args when the Android client socket drops (clean or crash)
+        self.on_client_disconnect_callback = on_client_disconnect_callback
         self.server_sock = None
         self.client_sock = None
         self.client_addr = None
@@ -280,6 +282,14 @@ class TCPHostServer:
                 client_sock.close()
             except Exception:
                 pass
+            # Notify the mouse hook so it can untrap the cursor immediately on drop.
+            # This closes the window between TCP drop and the next INIT where
+            # cursor_on_android would otherwise stay True with a live treadmill.
+            if self.on_client_disconnect_callback:
+                try:
+                    self.on_client_disconnect_callback()
+                except Exception as e:
+                    logger.error(f"Error in on_client_disconnect_callback: {e}")
 
     def _dispatch_client_message(self, msg: str, client_ip: str):
         """Routes a single decoded message from the Android client."""
