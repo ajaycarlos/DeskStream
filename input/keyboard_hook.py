@@ -7,50 +7,72 @@ logger = logging.getLogger("deskstream.keyboard_hook")
 
 class KeyboardHookManager:
     """
-    Manages global keyboard capturing.
+    Manages global keyboard capturing for DeskStream Sync.
 
-    FIX NOTES (catastrophic lockup prevention):
-    - pynput's keyboard.Listener with suppress=True performs an XGrabKeyboard()
-      call that seizes ALL key events at the X server level.  If the listener
-      thread dies unexpectedly (unhandled exception, crash, etc.) while the grab
-      is active, the grab is never released.  The keyboard then appears completely
-      dead to every application including the window manager, and recovery
-      requires a hard reboot.
-    - The fix is:
-        1. Never start a new suppressed listener while one is already running –
-           _stop_listener() must fully join/wait the old one first.
-        2. Register an atexit handler that unconditionally releases suppression
-           even if the main process exits abnormally.
-        3. In _on_press / _on_release check the focus flag and return early
-           (effectively a no-op) if focus was lost mid-press.
-    - We still keep suppress=True because without it the keystrokes would echo
-      into whatever is focused on the PC host.  But we guard every path that
-      could leave the grab dangling.
+    ── Architecture: Dual-Listener Pattern ──────────────────────────────────────
+    This class uses the same dual-listener design as MouseHookManager, adapted for
+    keyboard events.
+
+    LISTENER 1 – _observe_listener (suppress=False, always running while started):
+      An observe-only (no XGrabKeyboard) listener on the primary keyboard.
+      It fires _on_press / _on_release for every keypress.  These callbacks check
+      `keyboard_focused_on_android` and forward the event over TCP if focused.
+      Because suppress=False, it NEVER grabs the X11 keyboard; it can safely run
+      at all times without any lockup risk.
+
+    LISTENER 2 – _suppress_listener (suppress=True, only while focused=True):
+      A secondary listener started ONLY when `update_suppression_state(True)` is
+      called (i.e. the user left-clicked on the Android cursor focus area).
+      Its callbacks are no-ops; its sole purpose is to consume the X11 key events
+      so they do NOT reach the focused PC application (the "leak" bug).
+      It is always cleanly stopped (with join) before a new one is started.
+
+    WHY THIS FIXES THE LEAK:
+      The old single-listener design relied on the suppress=True flag on the
+      SAME listener that called the forward callback.  The deadlock happened because
+      _on_press (running on the listener thread) spawned a daemon thread calling
+      stop() → join(), which waited for... the listener thread itself.  Infinite wait.
+
+      In the dual model:
+        • _observe_listener fires _on_press (suppress=False → no XGrab, can be called
+          from any context safely, including from within the listener thread).
+        • _suppress_listener is a completely separate thread. Stopping it from
+          _on_press is safe because _on_press is on the OBSERVE listener thread,
+          not the SUPPRESS listener thread.  join() on the suppress listener will
+          always succeed because no listener is waiting for itself.
+
+    ── XGrabKeyboard safety ─────────────────────────────────────────────────────
+    - _suppress_listener is always stopped (with a 2-second join) before a new one
+      is started, preventing double-grab undefined behaviour.
+    - An atexit handler unconditionally stops the suppress listener even if the
+      process exits abnormally (crash, SIGKILL-adjacent, etc.).
+    - _stop_suppress_listener() is safe to call from ANY thread, including from
+      within the observe listener's callback thread.
     """
 
     SPECIAL_KEY_MAP = {
-        keyboard.Key.backspace: "BACKSPACE",
-        keyboard.Key.enter: "ENTER",
-        keyboard.Key.tab: "TAB",
-        keyboard.Key.esc: "ESCAPE",
-        keyboard.Key.left: "LEFT",
-        keyboard.Key.right: "RIGHT",
-        keyboard.Key.up: "UP",
-        keyboard.Key.down: "DOWN",
-        keyboard.Key.delete: "DELETE",
-        keyboard.Key.home: "HOME",
-        keyboard.Key.end: "END",
-        keyboard.Key.page_up: "PAGE_UP",
-        keyboard.Key.page_down: "PAGE_DOWN",
-        keyboard.Key.caps_lock: "CAPS_LOCK",
-        keyboard.Key.shift: "SHIFT",
-        keyboard.Key.shift_r: "SHIFT",
-        keyboard.Key.ctrl: "CTRL",
-        keyboard.Key.ctrl_r: "CTRL",
-        keyboard.Key.alt: "ALT",
-        keyboard.Key.alt_gr: "ALT",
-        keyboard.Key.cmd: "COMMAND",
-        keyboard.Key.cmd_r: "COMMAND",
+        keyboard.Key.backspace:  "BACKSPACE",
+        keyboard.Key.enter:      "ENTER",
+        keyboard.Key.tab:        "TAB",
+        keyboard.Key.esc:        "ESCAPE",
+        keyboard.Key.left:       "LEFT",
+        keyboard.Key.right:      "RIGHT",
+        keyboard.Key.up:         "UP",
+        keyboard.Key.down:       "DOWN",
+        keyboard.Key.delete:     "DELETE",
+        keyboard.Key.home:       "HOME",
+        keyboard.Key.end:        "END",
+        keyboard.Key.page_up:    "PAGE_UP",
+        keyboard.Key.page_down:  "PAGE_DOWN",
+        keyboard.Key.caps_lock:  "CAPS_LOCK",
+        keyboard.Key.shift:      "SHIFT",
+        keyboard.Key.shift_r:    "SHIFT",
+        keyboard.Key.ctrl:       "CTRL",
+        keyboard.Key.ctrl_r:     "CTRL",
+        keyboard.Key.alt:        "ALT",
+        keyboard.Key.alt_gr:     "ALT",
+        keyboard.Key.cmd:        "COMMAND",
+        keyboard.Key.cmd_r:      "COMMAND",
     }
 
     active_instance = None
@@ -62,13 +84,19 @@ class KeyboardHookManager:
         """
         self.on_key_event_callback = on_key_event_callback
         self._mouse_hook = mouse_hook
-        self.listener = None
-        self.lock = threading.Lock()
 
-        # ── FIX: atexit safety net ────────────────────────────────────────────
-        # If Python exits for any reason (exception, signal, etc.) while
-        # suppress=True is active, the atexit handler forces listener teardown
-        # before the interpreter shuts down, releasing the X11 grab.
+        # LISTENER 1: observe-only (suppress=False).  Started by start(), stopped by stop().
+        self._observe_listener: keyboard.Listener | None = None
+
+        # LISTENER 2: suppress=True.  Started/stopped by update_suppression_state().
+        self._suppress_listener: keyboard.Listener | None = None
+
+        # _observe_lock guards _observe_listener lifecycle.
+        # _suppress_lock guards _suppress_listener lifecycle.
+        # They are intentionally SEPARATE to avoid any cross-lock ordering deadlocks.
+        self._observe_lock = threading.Lock()
+        self._suppress_lock = threading.Lock()
+
         import atexit
         atexit.register(self._emergency_release)
 
@@ -94,114 +122,165 @@ class KeyboardHookManager:
 
     @property
     def is_trapped(self) -> bool:
-        """True when keyboard input is being captured and suppressed."""
+        """True when keyboard input is being forwarded and suppressed."""
         mh = self.mouse_hook
-        if mh:
-            return mh.keyboard_focused_on_android
-        return False
+        return bool(mh and mh.keyboard_focused_on_android)
 
-    @is_trapped.setter
-    def is_trapped(self, value: bool):
-        # Click-to-focus owns the state; this setter is kept for compat only.
-        logger.info(f"is_trapped property set to {value} (no-op in click-to-focus mode)")
+    # ── Public lifecycle ─────────────────────────────────────────────────────
+
+    def start(self):
+        """
+        Starts the always-on observe-only listener (LISTENER 1).
+        Safe to call multiple times; a running listener is not restarted.
+        """
+        with self._observe_lock:
+            if self._observe_listener is not None:
+                logger.debug("Observe keyboard listener already running.")
+                return
+            try:
+                ol = keyboard.Listener(
+                    on_press=self._on_press,
+                    on_release=self._on_release,
+                    suppress=False      # ← NO XGrabKeyboard; zero lockup risk
+                )
+                ol.start()
+                self._observe_listener = ol
+                logger.info("Observe-only keyboard listener started.")
+            except Exception as e:
+                logger.error(f"Failed to start observe keyboard listener: {e}")
+                self._observe_listener = None
+
+    def stop(self):
+        """Stops both listeners and releases all X11 grabs."""
+        self._stop_suppress_listener()
+        with self._observe_lock:
+            self._stop_observe_listener_under_lock()
 
     def update_suppression_state(self, focused: bool):
         """
-        Starts (focused=True) or stops (focused=False) keyboard suppression.
-        Thread-safe: can be called from any thread.
+        Called by MouseHookManager when keyboard focus on Android changes.
+        focused=True  → start LISTENER 2 (suppress X11 key events to stop PC leak).
+        focused=False → stop  LISTENER 2 (return normal key delivery to PC apps).
+
+        Safe to call from any thread, INCLUDING from within _on_press (observe thread).
+        The suppress listener is a separate thread from the observe listener, so
+        join() on it from _on_press will never deadlock.
         """
-        with self.lock:
-            if focused:
-                self._start_listener_under_lock()
-            else:
-                self._stop_listener_under_lock()
+        if focused:
+            self._start_suppress_listener()
+        else:
+            self._stop_suppress_listener()
 
-    # ── Listener lifecycle (must be called under self.lock) ──────────────────
+    # ── Listener 1: observe lifecycle (under _observe_lock) ─────────────────
 
-    def _start_listener_under_lock(self):
-        """(Re)starts keyboard suppression. Caller must hold self.lock."""
-        # ── FIX: always tear down the existing listener cleanly first ─────────
-        # Starting a second suppressed listener without stopping the first
-        # results in two concurrent XGrabKeyboard calls, undefined behaviour,
-        # and a grab that can never be fully released.
-        self._stop_listener_under_lock()
-
+    def _stop_observe_listener_under_lock(self):
+        """Caller must hold self._observe_lock."""
+        ol = self._observe_listener
+        if ol is None:
+            return
+        self._observe_listener = None
         try:
-            self.listener = keyboard.Listener(
-                on_press=self._on_press,
-                on_release=self._on_release,
-                suppress=True          # suppress=True IS correct here for keyboard
-            )
-            self.listener.start()
-            logger.info("Keyboard listener started in suppression mode.")
+            ol.stop()
+            if ol.is_alive():
+                ol.join(timeout=2.0)
+                if ol.is_alive():
+                    logger.warning("Observe keyboard listener did not exit within 2s.")
         except Exception as e:
-            # If we cannot start the listener, make absolutely sure no partial
-            # grab was left dangling.
-            logger.error(f"Failed to start keyboard listener: {e}")
-            self.listener = None
+            logger.debug(f"Error stopping observe keyboard listener: {e}")
+        logger.info("Observe keyboard listener stopped.")
 
-    def _stop_listener_under_lock(self):
-        """Stops the keyboard listener. Caller must hold self.lock."""
-        if self.listener:
+    # ── Listener 2: suppress lifecycle ───────────────────────────────────────
+
+    def _start_suppress_listener(self):
+        """
+        (Re)starts the suppress=True listener.
+        Always tears down the old one first to prevent double XGrabKeyboard.
+        """
+        with self._suppress_lock:
+            # Stop any existing suppress listener cleanly before starting a new one.
+            self._stop_suppress_listener_under_lock()
             try:
-                self.listener.stop()
-                # ── FIX: join the listener thread before proceeding ───────────
-                # pynput's Listener.stop() signals the thread to exit, but the
-                # XReleaseKeyboard call happens asynchronously inside that thread.
-                # Joining ensures the X11 grab is fully released before we
-                # proceed (e.g. before starting a new listener or returning to
-                # the caller who may immediately assume native input is restored).
-                if self.listener.is_alive():
-                    self.listener.join(timeout=2.0)
-                    if self.listener.is_alive():
-                        logger.warning("Keyboard listener thread did not exit cleanly within 2s.")
+                sl = keyboard.Listener(
+                    on_press=self._suppress_noop,
+                    on_release=self._suppress_noop,
+                    suppress=True       # ← This IS the XGrabKeyboard; intentional.
+                )
+                sl.start()
+                self._suppress_listener = sl
+                logger.info("Suppress keyboard listener started (X11 keys swallowed – PC leak stopped).")
             except Exception as e:
-                logger.debug(f"Error stopping keyboard listener: {e}")
-            finally:
-                self.listener = None
-            logger.info("Keyboard listener stopped. Native input restored.")
+                logger.error(f"Failed to start suppress keyboard listener: {e}")
+                self._suppress_listener = None
+
+    def _stop_suppress_listener(self):
+        """Stops the suppress listener. Safe to call from ANY thread."""
+        with self._suppress_lock:
+            self._stop_suppress_listener_under_lock()
+
+    def _stop_suppress_listener_under_lock(self):
+        """Caller must hold self._suppress_lock."""
+        sl = self._suppress_listener
+        if sl is None:
+            return
+        self._suppress_listener = None
+        try:
+            sl.stop()
+            if sl.is_alive():
+                sl.join(timeout=2.0)
+                if sl.is_alive():
+                    logger.warning("Suppress keyboard listener did not exit within 2s.")
+        except Exception as e:
+            logger.debug(f"Error stopping suppress keyboard listener: {e}")
+        logger.info("Suppress keyboard listener stopped. Native key delivery restored.")
+
+    @staticmethod
+    def _suppress_noop(key):
+        """Suppress-listener callback: silently consume the event."""
+        pass
 
     # ── Emergency teardown ───────────────────────────────────────────────────
 
     def _emergency_release(self):
         """
-        Called by atexit.  Forces listener teardown to release XGrabKeyboard
-        even if the normal shutdown path was never reached (crash, signal, etc.).
+        atexit handler. Forces teardown of the suppress listener to release
+        XGrabKeyboard even if the normal shutdown path was never reached.
+        Errors are silently swallowed because logging may be torn down by the time
+        atexit handlers run.
         """
         try:
-            with self.lock:
-                self._stop_listener_under_lock()
+            self._stop_suppress_listener()
         except Exception:
-            pass  # Can't log reliably in atexit; just swallow silently.
+            pass
 
-    # ── pynput callbacks ─────────────────────────────────────────────────────
+    # ── pynput observe callbacks ─────────────────────────────────────────────
 
     def _on_press(self, key):
-        """Processes and forwards key-press events to the Android client."""
-        # ── FIX: double-check focus inside the callback ───────────────────────
-        # The focus state can change between the moment the listener was started
-        # and the moment a key fires (e.g. network disconnect clears focus).
-        # If focus is already gone, treat the key as passthrough: returning
-        # False from a suppressed listener tells pynput to propagate the event
-        # to the OS instead of eating it.  However, pynput's suppress mode
-        # doesn't actually support per-key passthrough on Linux/X11 – the
-        # XGrabKeyboard has already consumed it.  The correct fix is to stop
-        # the listener (which releases the grab) rather than trying to
-        # re-inject a suppressed key.  We therefore just log and return.
+        """
+        Called by LISTENER 1 (suppress=False) for every keypress.
+
+        If `keyboard_focused_on_android` is True:
+          • Build the protocol payload and send it to the Android client.
+          • The X11 event is simultaneously consumed by LISTENER 2 (suppress=True)
+            so it never reaches the focused PC application.
+
+        If `keyboard_focused_on_android` is False:
+          • Do nothing; the key passes through to the PC normally (LISTENER 1
+            does NOT suppress it, and LISTENER 2 is not running).
+
+        There is NO deadlock risk here: this callback runs on the _observe_listener
+        thread (suppress=False).  If focus is lost mid-stream and we need to stop
+        the suppress listener, we call _stop_suppress_listener() which joins the
+        SEPARATE _suppress_listener thread — not ourselves.
+        """
         mh = self.mouse_hook
         if not (mh and mh.keyboard_focused_on_android):
-            # Focus was lost; stop the listener to release the grab ASAP.
-            # Use a daemon thread so we don't deadlock (can't call stop from
-            # inside the listener's own thread).
-            threading.Thread(
-                target=self.update_suppression_state,
-                args=(False,),
-                daemon=True
-            ).start()
+            # Not focused on Android → let the key through normally (no-op here).
+            # Also ensure the suppress listener is stopped in case focus was just lost.
+            # This call is safe: it joins _suppress_listener, not the observe thread.
+            self._stop_suppress_listener()
             return
 
         payload = None
-
         if hasattr(key, 'char') and key.char is not None:
             payload = f"K:TEXT:{key.char}"
         elif key == keyboard.Key.space:
@@ -216,12 +295,5 @@ class KeyboardHookManager:
                 logger.error(f"Error executing key event callback: {e}")
 
     def _on_release(self, key):
-        """Key release callback. Currently a no-op; release signals are not forwarded."""
+        """Key release: no-op (release signals are not forwarded to Android)."""
         pass
-
-    # ── Public cleanup ───────────────────────────────────────────────────────
-
-    def stop(self):
-        """Cleans up the keyboard hook and releases all X11 grabs."""
-        with self.lock:
-            self._stop_listener_under_lock()

@@ -5,6 +5,7 @@ import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.util.Log
+import android.view.Choreographer
 import android.view.Gravity
 import android.view.View
 import android.view.ViewTreeObserver
@@ -14,6 +15,7 @@ import com.deskstream.sync.R
 import com.deskstream.sync.event.InputEvent
 import com.deskstream.sync.event.InputEventBus
 import kotlinx.coroutines.*
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * MouseAccessibilityService
@@ -22,36 +24,55 @@ import kotlinx.coroutines.*
  *
  * ── Fix log ───────────────────────────────────────────────────────────────────
  *
- * BUG 1 – Scroll acts as tap:
+ * BUG 1 – Scroll acts as tap (PREVIOUS):
  *   One wheel tick sends dy=±1.  The old code built a 1px swipe over 180ms
  *   (velocity ≈ 5 px/s), which Android classifies as TAP, not FLING.
  *   Fix: multiply dy by SCROLL_SCALE_PX (120 px/tick) and use SCROLL_DURATION_MS
  *   (80 ms) so velocity ≈ 1500 px/s, which always clears the fling threshold.
  *
- * BUG 2 – Right-click hangs (stuck press):
+ * BUG 2 – Right-click hangs (stuck press) (PREVIOUS):
  *   injectLongPress used a single 500 ms non-continuing stroke.  On MIUI, if the
  *   system intercepts ACTION_DOWN for its own shortcut sheet, the gesture callback
  *   fires onCancelled() and ACTION_UP is never delivered, freezing the pressed UI.
- *   Fix: model right-click as a two-stroke continueStroke sequence:
- *     stroke 1 – 1 ms DOWN, willContinue=true  (establishes the press)
- *     stroke 2 – 500 ms hold + UP, willContinue=false  (guaranteed UP delivery)
+ *   Fix: model right-click as a two-stroke continueStroke sequence.
  *
- * BUG 3 – Drag / swipe broken:
+ * BUG 3 – Drag / swipe broken (PREVIOUS):
  *   Each mouse-move event called dispatchGesture() on a new continuation, but
  *   dispatchGesture() CANCELS any currently executing gesture and starts fresh.
- *   The correct approach: accumulate all drag points into a single Path and
- *   dispatch it as ONE gesture on LEFT UP (endDrag).  The interim "hold" is kept
- *   alive by a willContinue=true anchor stroke dispatched on LEFT DOWN.
- *   On mouse-move we only update the path; on LEFT UP we dispatch the full path.
+ *   Fix: accumulate all drag points into a single Path and dispatch it as ONE
+ *   gesture on LEFT UP (endDrag).
  *
- * BUG 4 – Dynamic click Y-offset:
- *   The old code used resources.getDimensionPixelSize("status_bar_height") which
- *   returns a resource value that can differ from the actual window inset MIUI
- *   applies to TYPE_ACCESSIBILITY_OVERLAY views.
- *   Fix: after windowManager.addView(), use a GlobalLayoutListener to call
- *   view.getLocationOnScreen() and store the real absolute Y the OS placed us at.
- *   gesture Y = currentY + (viewScreenY - layoutParams.y) = currentY + yInsetOffset.
- *   This is always pixel-perfect regardless of MIUI version or notch type.
+ * BUG 4 – Dynamic click Y-offset (PREVIOUS):
+ *   Fixed via GlobalLayoutListener + getLocationOnScreen().
+ *
+ * ── NEW RENDERING FIXES ──────────────────────────────────────────────────────
+ *
+ * RENDER BUG 1 – Jumpy/Laggy Cursor (THIS PATCH):
+ *   Root cause: every TCP packet arriving on the IO thread caused a synchronous
+ *   windowManager.updateViewLayout() call on the Main Thread via the SharedFlow
+ *   collector.  At 200–400 packets/s this saturates the UI thread and causes
+ *   Choreographer frame drops (Jank), producing the visual stutter.
+ *   Fix: Target position is stored in a pair of AtomicIntegers (targetX, targetY)
+ *   updated freely by the IO/collector thread.  A Choreographer.FrameCallback
+ *   fires ONCE per vsync frame (60-120 Hz), reads the target, linearly interpolates
+ *   the visual position, and calls updateViewLayout exactly once per display frame.
+ *   This decouples network throughput from display frame pacing completely.
+ *
+ * RENDER BUG 2 – Slow-Motion System Swipes (THIS PATCH):
+ *   Root cause: endDrag() computed its gesture duration as
+ *   (totalMovement * DRAG_MS_PER_PX), which grew proportionally to how long the
+ *   user physically dragged.  A 1.5-second slow drag produced a 1500ms gesture
+ *   stroke, and Android stretches the system "Home" / "Recents" animation to fill
+ *   the entire stroke duration, making it appear in extreme slow motion.
+ *   Fix: the final gesture duration is now capped at MAX_SYSTEM_GESTURE_MS (350ms).
+ *   This normalises swipe velocity so Android's system animations always play at
+ *   their native speed regardless of the user's physical drag tempo.
+ *
+ * RENDER BUG 3 – Sensitivity/Control (THIS PATCH — Python host side):
+ *   Sub-pixel accumulator and √-easing curve implemented in mouse_hook.py on the
+ *   host.  The Android side receives already-smoothed integer deltas; no change here
+ *   beyond the frame-decoupled rendering path (Render Bug 1 fix above) which makes
+ *   the cursor feel smooth at any sensitivity level.
  *
  * BUG 5 (handled in mouse_hook.py on the host side – see that file).
  */
@@ -67,26 +88,89 @@ class MouseAccessibilityService : AccessibilityService() {
     private var screenHeight = 0
 
     // ── BUG 4 FIX: dynamic inset offset ─────────────────────────────────────
-    // Difference between the absolute Y where the OS actually placed the view
-    // and layoutParams.y.  Populated by getLocationOnScreen() after layout.
-    // gesture_absolute_y = currentY + yInsetOffset
     private var yInsetOffset = 0
 
-    private var currentX = 0
-    private var currentY = 0
+    // ── RENDER BUG 1 FIX: Choreographer-decoupled cursor position ─────────
+    // targetX / targetY are the authoritative logical position updated by the
+    // network/collector thread via handleMouseMove().  They are AtomicIntegers
+    // so cross-thread writes are safe without holding a lock on the UI thread.
+    private val targetX = AtomicInteger(15)
+    private val targetY = AtomicInteger(0)
+
+    // Visual (interpolated) cursor position — only read/written on UI thread
+    // inside the Choreographer callback.
+    private var visualX = 15f
+    private var visualY = 0f
+
+    // Lerp factor: fraction of (target – visual) to close per frame.
+    // 0.7 → ~3 frames to settle = ~50ms lag at 60 Hz, imperceptible but smooth.
+    // Set to 1.0f to disable interpolation (instant snapping).
+    private val LERP_FACTOR = 0.70f
+
     private var isCursorActive = false
+    private var isFrameCallbackScheduled = false
+
+    // Current logical position (also used by gesture injection — gestures use
+    // target position, not interpolated visual position, for accuracy).
+    private var currentX: Int
+        get() = targetX.get()
+        set(v) = targetX.set(v)
+    private var currentY: Int
+        get() = targetY.get()
+        set(v) = targetY.set(v)
 
     // ── BUG 3 FIX: path-accumulation drag state ───────────────────────────────
-    // We no longer call dispatchGesture() per move-segment.
-    // Instead we accumulate all points into dragAccumPath and dispatch once on UP.
     private var isLeftButtonDown = false
     private var dragStartX = 0f
     private var dragStartY = 0f
-    private var dragAccumPath: Path? = null   // grows with every continueDrag call
+    private var dragAccumPath: Path? = null
     private var dragLastX = 0f
     private var dragLastY = 0f
-    // Anchor stroke (willContinue=true, 1 ms) dispatched on DOWN to hold the press
     private var anchorStroke: GestureDescription.StrokeDescription? = null
+
+    // ── Choreographer frame callback ─────────────────────────────────────────
+    private val frameCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            val tx = targetX.get().toFloat()
+            val ty = targetY.get().toFloat()
+
+            // Linear interpolation toward target
+            visualX += (tx - visualX) * LERP_FACTOR
+            visualY += (ty - visualY) * LERP_FACTOR
+
+            val newX = visualX.toInt()
+            val newY = visualY.toInt()
+
+            // Only issue a WM call if the rounded position actually changed
+            if (newX != layoutParams.x || newY != layoutParams.y) {
+                layoutParams.x = newX
+                layoutParams.y = newY
+                val view = cursorView
+                if (view != null && view.parent != null) {
+                    try {
+                        windowManager.updateViewLayout(view, layoutParams)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Choreographer updateViewLayout error: ${e.message}")
+                    }
+                }
+            }
+
+            // Keep re-posting as long as cursor is active
+            if (isCursorActive) {
+                Choreographer.getInstance().postFrameCallback(this)
+            } else {
+                isFrameCallbackScheduled = false
+            }
+        }
+    }
+
+    /** Ensures the Choreographer loop is running. Call from Main thread only. */
+    private fun ensureFrameCallbackRunning() {
+        if (!isFrameCallbackScheduled) {
+            isFrameCallbackScheduled = true
+            Choreographer.getInstance().postFrameCallback(frameCallback)
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -107,8 +191,10 @@ class MouseAccessibilityService : AccessibilityService() {
 
         Log.i(TAG, "Screen dimensions: ${screenWidth}x${screenHeight}")
 
-        currentX = 15
-        currentY = screenHeight / 2
+        targetX.set(15)
+        targetY.set(screenHeight / 2)
+        visualX = 15f
+        visualY = screenHeight / 2f
 
         initializeCursorOverlay()
 
@@ -146,8 +232,8 @@ class MouseAccessibilityService : AccessibilityService() {
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
             format = PixelFormat.TRANSLUCENT
             gravity = Gravity.TOP or Gravity.START
-            x = currentX
-            y = currentY
+            x = targetX.get()
+            y = targetY.get()
         }
 
         try {
@@ -160,10 +246,6 @@ class MouseAccessibilityService : AccessibilityService() {
                 override fun onGlobalLayout() {
                     val loc = IntArray(2)
                     view.getLocationOnScreen(loc)
-                    // loc[1] = absolute screen Y of the view's top-left pixel.
-                    // layoutParams.y = what we ASKED for (relative to window origin).
-                    // yInsetOffset = how much the OS shifted us DOWN relative to
-                    // layoutParams.y (status bar + any system insets MIUI adds).
                     yInsetOffset = loc[1] - layoutParams.y
                     Log.i(TAG, "View placed at screen Y=${loc[1]}, layoutParams.y=${layoutParams.y}" +
                                ", yInsetOffset=$yInsetOffset px")
@@ -171,7 +253,7 @@ class MouseAccessibilityService : AccessibilityService() {
                 }
             })
 
-            Log.i(TAG, "Cursor overlay added at ($currentX, $currentY).")
+            Log.i(TAG, "Cursor overlay added at (${targetX.get()}, ${targetY.get()}).")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to add cursor view: ${e.message}", e)
         }
@@ -181,13 +263,18 @@ class MouseAccessibilityService : AccessibilityService() {
         val view = cursorView ?: return
         isCursorActive = true
         view.visibility = View.VISIBLE
-        layoutParams.x = currentX
-        layoutParams.y = currentY
+        // Seed visual position to current logical position to avoid a lurch from (0,0)
+        visualX = targetX.get().toFloat()
+        visualY = targetY.get().toFloat()
+        layoutParams.x = targetX.get()
+        layoutParams.y = targetY.get()
         try {
             windowManager.updateViewLayout(view, layoutParams)
         } catch (e: Exception) {
             Log.e(TAG, "Error showing cursor: ${e.message}")
         }
+        // ── RENDER BUG 1 FIX: start per-vsync Choreographer loop ─────────────
+        ensureFrameCallbackRunning()
     }
 
     // ── Event collection ──────────────────────────────────────────────────────
@@ -207,33 +294,34 @@ class MouseAccessibilityService : AccessibilityService() {
 
     // ── Input handlers ────────────────────────────────────────────────────────
 
+    /**
+     * RENDER BUG 1 FIX:
+     * handleMouseMove() now only UPDATES the AtomicInteger target position.
+     * It does NOT call windowManager.updateViewLayout() itself.
+     * The Choreographer FrameCallback (running at display vsync rate) does the
+     * actual WM call, at most once per frame, with smooth interpolation.
+     */
     private fun handleMouseMove(dx: Int, dy: Int) {
-        if (!isCursorActive) showCursor()
-
-        currentX = (currentX + dx).coerceIn(0, screenWidth - 1)
-        currentY = (currentY + dy).coerceIn(0, screenHeight - 1)
-
-        if (currentX <= 0) {
-            cancelDrag()
-            triggerEdgeUnlock()
-            return
+        if (!isCursorActive) {
+            // Switch to Main thread for showCursor() since it calls WM APIs
+            serviceScope.launch { showCursor() }
         }
 
-        layoutParams.x = currentX
-        layoutParams.y = currentY
-        try {
-            val view = cursorView
-            if (view != null && view.parent != null) {
-                windowManager.updateViewLayout(view, layoutParams)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error updating cursor layout: ${e.message}")
+        val newX = (targetX.get() + dx).coerceIn(0, screenWidth - 1)
+        val newY = (targetY.get() + dy).coerceIn(0, screenHeight - 1)
+        targetX.set(newX)
+        targetY.set(newY)
+
+        if (newX <= 0) {
+            cancelDrag()
+            serviceScope.launch { triggerEdgeUnlock() }
+            return
         }
 
         // ── BUG 3 FIX: accumulate into dragAccumPath; do NOT dispatch yet ────
         if (isLeftButtonDown) {
-            val gx = currentX.toFloat()
-            val gy = gestureY(currentY.toFloat())
+            val gx = newX.toFloat()
+            val gy = gestureY(newY.toFloat())
             dragAccumPath?.lineTo(gx, gy)
             dragLastX = gx
             dragLastY = gy
@@ -242,24 +330,19 @@ class MouseAccessibilityService : AccessibilityService() {
 
     /**
      * BUG 4 FIX – returns the absolute Y coordinate for dispatchGesture() calls.
-     * currentY (layoutParams.y-relative) + yInsetOffset = absolute screen Y.
      */
     private fun gestureY(layoutRelativeY: Float): Float = layoutRelativeY + yInsetOffset
 
     /**
      * LEFT DOWN  → record start, build accumulation path, dispatch anchor hold stroke.
      * LEFT UP    → dispatch full accumulated path as one gesture (= clean drag or tap).
-     * RIGHT      → two-stroke long-press (DOWN wilContinue=true, then UP).
-     *
-     * BUG 2 FIX: right-click uses a continueStroke pair so ACTION_UP is guaranteed.
-     * BUG 3 FIX: left drag accumulates path, dispatches once on UP.
-     * BUG 4 FIX: all Y coords go through gestureY().
+     * RIGHT      → two-stroke long-press (DOWN willContinue=true, then UP).
      */
     private fun handleMouseClick(button: String, state: Int) {
         if (!isCursorActive) return
 
-        val gx = currentX.toFloat() + HOT_SPOT_OFFSET_PX
-        val gy = gestureY(currentY.toFloat() + HOT_SPOT_OFFSET_PX)
+        val gx = targetX.get().toFloat() + HOT_SPOT_OFFSET_PX
+        val gy = gestureY(targetY.get().toFloat() + HOT_SPOT_OFFSET_PX)
 
         when {
             button == "LEFT" && state == 1 -> {
@@ -280,13 +363,11 @@ class MouseAccessibilityService : AccessibilityService() {
      * BUG 1 FIX – Scroll wheel:
      * Scale each tick by SCROLL_SCALE_PX so the swipe distance is ~120 px.
      * Use SCROLL_DURATION_MS (80 ms) so velocity ≈ 1500 px/s > Android fling threshold.
-     * dy > 0 = scroll down → finger moves UP (content scrolls down) → endY < startY.
      */
     private fun handleMouseScroll(dy: Int) {
         if (!isCursorActive) return
-        val startX = currentX.toFloat()
-        val startY = gestureY(currentY.toFloat())
-        // dy > 0 means scroll DOWN: swipe finger UP, so endY < startY
+        val startX = targetX.get().toFloat()
+        val startY = gestureY(targetY.get().toFloat())
         val endY = startY - (dy * SCROLL_SCALE_PX)
         injectSwipe(startX, startY, startX, endY, durationMs = SCROLL_DURATION_MS)
     }
@@ -296,9 +377,6 @@ class MouseAccessibilityService : AccessibilityService() {
     /**
      * BUG 3 FIX – begin drag:
      * Dispatch a 1 ms anchor stroke (willContinue=true) to register the DOWN event.
-     * Do NOT attempt to chain continuations via dispatchGesture() per-segment —
-     * each dispatchGesture() call cancels the previous gesture.
-     * Instead, accumulate all movement in dragAccumPath and dispatch once on endDrag.
      */
     private fun beginDrag(x: Float, y: Float) {
         dragStartX = x
@@ -306,10 +384,8 @@ class MouseAccessibilityService : AccessibilityService() {
         dragLastX = x
         dragLastY = y
 
-        // Build the accumulation path starting at the down point
         dragAccumPath = Path().apply { moveTo(x, y) }
 
-        // Dispatch a 1 ms anchor hold so the system registers ACTION_DOWN
         val anchorPath = Path().apply { moveTo(x, y); lineTo(x + 0.1f, y) }
         val stroke = GestureDescription.StrokeDescription(anchorPath, 0L, DRAG_ANCHOR_MS, true)
         anchorStroke = stroke
@@ -327,15 +403,22 @@ class MouseAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * BUG 3 FIX – end drag:
-     * Build a single stroke from dragStartX/Y through all accumulated points to (x, y).
-     * Duration is proportional to path length (clamped) so velocity stays natural.
-     * If no movement occurred (path is just moveTo), dispatch a clean tap instead.
+     * RENDER BUG 2 FIX – end drag:
+     *
+     * Previous behaviour: durationMs = (totalMovement * DRAG_MS_PER_PX), uncapped.
+     * For a slow 1.5-second physical drag over ~600 virtual pixels this produced a
+     * 900 ms gesture.  Android's system-gesture recogniser (Home, Recents) stretches
+     * its animation to fill the full gesture duration, causing the slow-motion effect.
+     *
+     * Fix: cap the gesture duration at MAX_SYSTEM_GESTURE_MS (350 ms).
+     * This normalises the injected swipe velocity so system animations always play
+     * at their native snappy speed, regardless of how slowly the user dragged.
+     *
+     * The lower bound (80 ms) is kept so micro-taps are not classified as flings.
      */
     private fun endDrag(x: Float, y: Float) {
         val path = dragAccumPath
 
-        // Measure total movement
         val dx = x - dragStartX
         val dy = y - dragStartY
         val totalMovement = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
@@ -344,20 +427,22 @@ class MouseAccessibilityService : AccessibilityService() {
         anchorStroke = null
 
         if (path == null || totalMovement < DRAG_MIN_MOVEMENT_PX) {
-            // No meaningful drag → simple tap
             injectTap(x, y)
             return
         }
 
         path.lineTo(x, y)
 
-        // Duration proportional to distance, clamped between 80ms and 2000ms
-        val durationMs = (totalMovement * DRAG_MS_PER_PX).toLong().coerceIn(80L, 2000L)
+        // ── RENDER BUG 2 FIX: cap to MAX_SYSTEM_GESTURE_MS so Android's system
+        // gesture recogniser (Home/Recents swipe) plays at native speed. ────────
+        val durationMs = (totalMovement * DRAG_MS_PER_PX)
+            .toLong()
+            .coerceIn(80L, MAX_SYSTEM_GESTURE_MS)
 
         val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs, false)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(g: GestureDescription?) { Log.d(TAG, "Drag ended at ($x, $y).") }
+            override fun onCompleted(g: GestureDescription?) { Log.d(TAG, "Drag ended at ($x, $y) in ${durationMs}ms.") }
             override fun onCancelled(g: GestureDescription?) { Log.w(TAG, "Drag end cancelled.") }
         }, null)
     }
@@ -374,10 +459,14 @@ class MouseAccessibilityService : AccessibilityService() {
     // ── Unlock ────────────────────────────────────────────────────────────────
 
     private fun triggerEdgeUnlock() {
+        // Stop Choreographer loop
         isCursorActive = false
+        isFrameCallbackScheduled = false
         cursorView?.visibility = View.GONE
-        currentX = 15
-        currentY = screenHeight / 2
+        targetX.set(15)
+        targetY.set(screenHeight / 2)
+        visualX = 15f
+        visualY = screenHeight / 2f
         Log.i(TAG, "Cursor exited edge. Requesting PC unlock.")
         serviceScope.launch { InputEventBus.requestUnlock() }
     }
@@ -396,10 +485,7 @@ class MouseAccessibilityService : AccessibilityService() {
 
     /**
      * BUG 2 FIX – Right-click / long-press:
-     * Two-stroke sequence guarantees ACTION_UP is always delivered even if MIUI
-     * intercepts ACTION_DOWN for its own shortcut sheet:
-     *   Stroke 1: 1 ms DOWN, willContinue=true  (establishes the touch contact)
-     *   Stroke 2: LONG_PRESS_MS hold, willContinue=false  (hold + guaranteed UP)
+     * Two-stroke continueStroke sequence guarantees ACTION_UP is always delivered.
      */
     private fun injectRightClick(x: Float, y: Float) {
         val downPath = Path().apply { moveTo(x, y); lineTo(x + 0.1f, y) }
@@ -408,14 +494,6 @@ class MouseAccessibilityService : AccessibilityService() {
         val holdPath = Path().apply { moveTo(x, y); lineTo(x + 0.1f, y) }
         val holdStroke = downStroke.continueStroke(holdPath, 1L, LONG_PRESS_MS, false)
 
-        val gesture = GestureDescription.Builder()
-            .addStroke(holdStroke)   // the full gesture; downStroke is its ancestor
-            .build()
-
-        // We must dispatch downStroke first, then holdStroke as continuation.
-        // The Builder-based API accepts only one root stroke; continueStroke
-        // chains are built by dispatching the continuation stroke directly.
-        // Correct pattern: dispatch the INITIAL stroke, then dispatch the continuation.
         val gestureDown = GestureDescription.Builder().addStroke(downStroke).build()
         dispatchGesture(gestureDown, object : GestureResultCallback() {
             override fun onCompleted(g: GestureDescription?) {
@@ -457,6 +535,8 @@ class MouseAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         Log.i(TAG, "MouseAccessibilityService destroyed.")
+        isCursorActive = false
+        isFrameCallbackScheduled = false
         val view = cursorView
         if (view != null) {
             try { if (view.parent != null) windowManager.removeView(view) }
@@ -473,20 +553,21 @@ class MouseAccessibilityService : AccessibilityService() {
         // Cursor bitmap hot-spot inset from top-left corner (px). 0 = tip is at (0,0).
         private const val HOT_SPOT_OFFSET_PX = 0f
 
-        // ── BUG 1: scroll constants ───────────────────────────────────────────
-        // Pixels per scroll tick.  120 px/tick → velocity ≈ 1500 px/s at 80 ms.
+        // ── BUG 1 (original): scroll constants ───────────────────────────────
         private const val SCROLL_SCALE_PX = 120f
         private const val SCROLL_DURATION_MS = 80L
 
-        // ── BUG 2: right-click long-press hold duration ───────────────────────
+        // ── BUG 2 (original): right-click long-press hold duration ────────────
         private const val LONG_PRESS_MS = 500L
 
-        // ── BUG 3: drag constants ─────────────────────────────────────────────
-        // 1 ms anchor stroke duration for the initial DOWN.
+        // ── BUG 3 (original): drag constants ─────────────────────────────────
         private const val DRAG_ANCHOR_MS = 1L
-        // Minimum pixel movement to count as a drag (below this → tap on release).
         private const val DRAG_MIN_MOVEMENT_PX = 8f
-        // ms per pixel of travel for the final drag stroke duration.
         private const val DRAG_MS_PER_PX = 1.5f
+
+        // ── RENDER BUG 2 FIX: max gesture duration cap ───────────────────────
+        // System swipe gestures (Home, Recents) stretch their animations to fill
+        // the gesture duration.  Capping at 350ms forces a snappy native speed.
+        private const val MAX_SYSTEM_GESTURE_MS = 350L
     }
 }

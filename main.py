@@ -68,15 +68,17 @@ class DeskStreamApp:
     def _handle_screen_exit(self, edge, trap_x, trap_y):
         """Callback fired when the mouse hits the configured screen boundary past the friction threshold."""
         logger.info(f"Boundary breach detected on edge: {edge}. Routing controls to Android.")
-        
+
         # 1. Activate UDP/TCP coordinate data streams
         self.connection.start_streaming()
-        
+
         # 2. Lock the local mouse position to trap it at the screen boundary
         self.mouse_hook.trap_cursor(trap_x, trap_y)
 
-        # 3. Activate keyboard suppression and redirect keystrokes
-        self.keyboard_hook.is_trapped = True
+        # 3. Keyboard suppression is driven by click-to-focus (left-click on Android
+        #    sets mouse_hook.keyboard_focused_on_android which notifies keyboard_hook).
+        #    No explicit suppression call needed here; setting it would race with the
+        #    click-to-focus path and potentially start the suppress listener twice.
 
     def _handle_device_info(self, width: int, height: int, density_dpi: int = 0):
         """Callback fired when the Android client sends its INIT resolution packet."""
@@ -102,15 +104,17 @@ class DeskStreamApp:
     def _handle_unlock_request(self):
         """Callback fired when the Android client sends an UNLOCK message."""
         logger.info("Unlock command received from connection bridge. Releasing inputs.")
-        
+
         # 1. Deactivate streaming
         self.connection.stop_streaming()
-        
-        # 2. Release local mouse cursor
+
+        # 2. Release local mouse cursor (also clears keyboard_focused_on_android,
+        #    which in turn calls keyboard_hook.update_suppression_state(False))
         self.mouse_hook.untrap_cursor()
 
-        # 3. Disable keyboard suppression
-        self.keyboard_hook.is_trapped = False
+        # 3. Belt-and-suspenders: ensure suppress listener is stopped even if the
+        #    mouse hook's notification path had an exception.
+        self.keyboard_hook.update_suppression_state(False)
 
     def _queue_settings(self):
         """Pushes settings window request to GUI event queue."""
@@ -157,11 +161,16 @@ class DeskStreamApp:
         #    before any TCP client can trigger input-suppression callbacks.
         self.mouse_hook.start()
 
-        # 2. Start network server pipelines (TCP and UDP/ADB)
+        # 2. Start observe-only keyboard hook so key forwarding is live.
+        #    Must be before TCP start so the INIT handshake cannot race with
+        #    keyboard focus changes before the listener exists.
+        self.keyboard_hook.start()
+
+        # 3. Start network server pipelines (TCP and UDP/ADB)
         #    Safe now: pynput is fully initialised and ready.
         self.connection.start_services()
 
-        # 3. Start System Tray icon daemon
+        # 4. Start System Tray icon daemon
         self.tray.start()
 
         logger.info("DeskStream Sync Host application fully initialized.")

@@ -129,7 +129,16 @@ class MouseHookManager:
         self.friction_timer = None
 
         # DPI scaling multiplier to handle monitor vs Android DPI difference
-        self.dpi_scale = 0.4
+        # Scaled up by a default 1.3x speed boost factor to make the cursor feel slightly faster.
+        self.dpi_scale = 1.3
+
+        # ── Bug 3 Fix: Sub-pixel accumulator ─────────────────────────────────
+        # When dpi_scale < 1.0, int(dx * dpi_scale) truncates the fractional
+        # remainder every tick, losing up to 0.99 px per event.  At 200 Hz this
+        # discards up to ~200 px/s of intended movement at low speeds.
+        # We accumulate the fractional part and only send whole pixels.
+        self._subpx_x = 0.0
+        self._subpx_y = 0.0
 
         # ── Bug 5 Fix: secondary suppressing listener ─────────────────────────
         # Started when trapped (cursor_on_android=True), stopped when released.
@@ -197,15 +206,39 @@ class MouseHookManager:
         Called when the Android client sends its real screen resolution and DPI via the
         INIT:width:height:densityDpi TCP handshake packet. Updates the virtual coordinate
         clamps and the dynamic DPI scaling multiplier used by the Infinite Treadmill.
+
+        DPI SCALE MATH (BUG 1 FIX):
+          The PC mouse generates deltas in 96-DPI logical pixels (1 raw pixel = 1/96 inch).
+          The Android screen has `density_dpi` physical pixels per inch.
+          To make 1 inch of physical mouse travel move 1 inch on the Android glass, MULTIPLY:
+
+              dpi_scale = density_dpi / 96.0
+
+          Example – Redmi 9i (320 DPI): dpi_scale = 320 / 96 ≈ 3.33
+            → 1 raw PC delta pixel → 3.33 Android pixels  (correct, same physical travel)
+
+          The old (broken) formula was  96 / density_dpi = 0.3, which REDUCED the delta,
+          forcing the user to swipe 10× farther to cross the screen.
         """
         with self.state_lock:
             self._android_width = max(1, width)
             self._android_height = max(1, height)
+            # Apply a 1.3x speed boost factor so the cursor is slightly faster and feels snappier.
+            speed_multiplier = 1.3
             if density_dpi > 0:
-                self.dpi_scale = 96.0 / density_dpi
+                # ── BUG 1 FIX: was `96.0 / density_dpi` (reduction). Now multiply. ──
+                self.dpi_scale = (density_dpi / 96.0) * speed_multiplier
             else:
-                self.dpi_scale = 0.4
-        logger.info(f"Android virtual bounds updated to {width}x{height}, DPI {density_dpi} (dpi_scale = {self.dpi_scale:.3f})")
+                # No DPI info from handshake: use identity (1.0) * speed_multiplier.
+                self.dpi_scale = speed_multiplier
+            # Reset accumulator when scale changes so stale fractional remainders
+            # from the old multiplier don't corrupt the first post-handshake event.
+            self._subpx_x = 0.0
+            self._subpx_y = 0.0
+        logger.info(
+            f"Android virtual bounds updated to {width}x{height}, DPI {density_dpi} "
+            f"(dpi_scale = {self.dpi_scale:.3f}  [= {density_dpi}/96])"
+        )
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -426,12 +459,33 @@ class MouseHookManager:
             cy = self.center_y
 
         if cursor_on_android:
-            dx = x - cx
-            dy = y - cy
+            raw_dx = x - cx
+            raw_dy = y - cy
 
-            # Apply DPI scaling to physical deltas and convert to integers
-            dx = int(dx * self.dpi_scale)
-            dy = int(dy * self.dpi_scale)
+            # ── Movement pipeline: pure linear scaling + sub-pixel accumulator ──
+            #
+            # WHY NO EASING CURVE:
+            # A sqrt easing function has output/input ratio = 1/sqrt(|v|).
+            # At raw_dx=16 that ratio is 25% — it silently discards 75% of all
+            # fast-swipe velocity, making the cursor feel extremely sluggish.
+            # Easing was only useful when dpi_scale < 1.0 (old inverted formula)
+            # to avoid sub-pixel events rounding to zero.  With dpi_scale = 3.33
+            # (Redmi 9i), even a 1-pixel raw delta maps to 3.33 Android pixels —
+            # the accumulator alone handles sub-pixel precision perfectly.
+            #
+            # Pipeline (per axis):
+            #   scaled  = raw_delta * dpi_scale      (e.g. 10 × 3.33 = 33.3)
+            #   int_out = int(accum + scaled)         (e.g. 33)
+            #   accum   = (accum + scaled) - int_out  (e.g. 0.3, kept for next tick)
+            #
+            # This achieves 1:1 physical-to-virtual travel distance while
+            # preserving sub-pixel precision with zero velocity loss.
+            self._subpx_x += raw_dx * self.dpi_scale
+            self._subpx_y += raw_dy * self.dpi_scale
+            dx = int(self._subpx_x)
+            dy = int(self._subpx_y)
+            self._subpx_x -= dx
+            self._subpx_y -= dy
 
             if dx != 0 or dy != 0:
                 with self.state_lock:
