@@ -122,7 +122,17 @@ class MouseHookManager:
         self._android_width = 1080
         self._android_height = 2400
 
-        self._ignore_next_move = threading.Event()
+        # ── Bug 6 Fix: Phantom Event Storm Counter ──────────────────────────
+        # X11's async event queue can buffer multiple MotionNotify events BEFORE
+        # the WarpPointer call is processed by the server.  A single-shot
+        # threading.Event only absorbs the FIRST phantom event; subsequent ones
+        # (typically 2-4 in practice) each carry the full edge→center delta
+        # (e.g. raw_dx ≈ ±960 px) which at dpi_scale ≈ 3.33 injects ~3,200
+        # Android pixels per leaked event — the "speed explosion" symptom.
+        # An integer counter set to _TELEPORT_IGNORE_COUNT on every teleport
+        # robustly drains the entire phantom storm depth without a race.
+        self._ignore_move_count = 0
+        self._ignore_next_move = threading.Event()  # kept for API compat; drives count reset
 
         # Edge friction timing state variables
         self.at_edge = False
@@ -265,10 +275,14 @@ class MouseHookManager:
             # Cancel any pending edge-friction timers from the previous session.
             self._cancel_friction_timer_under_lock()
 
-        # ── Step 6: arm ignore flag (threading.Event is lock-free) ───────────────────
-        # Absorbs the first post-INIT X11 move event which may carry a large
-        # stale pre-teleport delta (belt-and-suspenders on top of the jitter guard).
-        self._ignore_next_move.set()
+        # ── Step 6: clear the legacy single-shot Event ────────────────────────────────
+        # Do NOT set it here — doing so races with trap_cursor()'s own .set() call
+        # when the user immediately re-traps after reconnect.  The Event would be
+        # consumed by the first phantom _on_move, leaving the remaining 2-5 X11
+        # buffered phantom events to slip past both gates (the confirmed reconnect
+        # speed-doubling root cause).  _ignore_move_count in trap_cursor() is the
+        # sole authoritative phantom-drain mechanism; the Event is legacy API compat.
+        self._ignore_next_move.clear()
 
         # ── Steps 7-8: teardown outside state_lock to avoid deadlock ─────────────────
         if was_trapped:
@@ -379,11 +393,30 @@ class MouseHookManager:
 
     # ── Cursor trap / untrap ─────────────────────────────────────────────────
 
+    # Number of _on_move events to discard after each teleport.
+    # Set conservatively to 6 to cover the deepest observed X11 phantom-event
+    # storm (typically 2-4 events; 6 adds margin for high-latency GPU compositors).
+    _TELEPORT_IGNORE_COUNT = 6
+
     def trap_cursor(self, x, y):
         """
         Initiates Infinite Treadmill mode: resets virtual android coordinates
         and teleports the physical cursor to the screen centre.
         Also starts the secondary suppressing listener to swallow PC clicks/scrolls.
+
+        BUG 6 FIX — Phantom Event Storm:
+          After mouse_controller.position = (cx, cy) the X11 server enqueues a
+          WarpPointer command, but MotionNotify events already buffered in the
+          XEvent queue for the pre-warp position are delivered FIRST.  These
+          carry the full edge→center delta and each one would inject thousands
+          of Android pixels if not suppressed.  The previous single-shot
+          threading.Event only blocked the FIRST phantom event.
+
+          Fix: _ignore_move_count is set to _TELEPORT_IGNORE_COUNT (6) before
+          each teleport and decremented by _on_move until it reaches zero.
+          The jitter guard (abs(raw_dx) > sw//2) is kept as a belt-and-suspenders
+          second line of defence for any edge case where the counter runs out
+          before the storm fully drains.
         """
         with self.state_lock:
             self.cursor_on_android = True
@@ -395,6 +428,10 @@ class MouseHookManager:
             # during operation, but an explicit reset is cleaner and safer.)
             self._subpx_x = 0.0
             self._subpx_y = 0.0
+            # Arm the phantom-event drain counter UNDER the lock so _on_move
+            # cannot race between reading cursor_on_android=True and seeing the
+            # counter still at zero.
+            self._ignore_move_count = self._TELEPORT_IGNORE_COUNT
             cx = self.center_x
             cy = self.center_y
 
@@ -402,15 +439,50 @@ class MouseHookManager:
         # that arrives during the teleport frame leaks to the PC.
         self._start_suppress_listener()
 
-        self._ignore_next_move.set()
+        # _ignore_move_count (set above under the lock) is the sole phantom-drain
+        # mechanism.  Do NOT also set _ignore_next_move here: doing so creates a
+        # double-arm race with set_android_resolution()'s .clear() path — on
+        # reconnect the Event would be armed here, consumed by the FIRST phantom
+        # _on_move invocation, leaving phantoms 2-5 to pass both gates.  Keep the
+        # Event cleared so only the counter drains the post-teleport storm.
+        self._ignore_next_move.clear()
         self.mouse_controller.position = (cx, cy)
-        logger.info(f"Treadmill initiated. Cursor centred at ({cx}, {cy}). Click suppression ON.")
+        logger.info(
+            f"Treadmill initiated. Cursor centred at ({cx}, {cy}). "
+            f"Click suppression ON. Ignoring next {self._TELEPORT_IGNORE_COUNT} move events."
+        )
 
     def untrap_cursor(self):
-        """Unlocks the physical mouse cursor, returning normal movement to the user."""
+        """
+        Unlocks the physical mouse cursor, returning normal movement to the user.
+
+        BUG 6 FIX — Accumulator State Leak:
+          Previously, _subpx_x/_subpx_y and android_x/android_y were NOT zeroed
+          here.  This meant that any sub-pixel fractional residue accumulated
+          during the current trap session, and the last virtual cursor position,
+          survived into the next trap session if trap_cursor() was called quickly
+          enough for _subpx_* to not have been reset yet.  While trap_cursor()
+          also zeroes these, the window between untrap and the next trap is a
+          state-leak hazard — especially when untrap is triggered externally
+          (e.g. on_client_disconnect) rather than from the escape branch.
+
+          Fix: zero all kinematic state atomically under state_lock on every
+          untrap so the system is always in a clean, known-good state between
+          sessions, regardless of which code path triggered the untrap.
+
+          _ignore_move_count is also reset to 0 so no phantom drain counter
+          from a previous teleport can suppress real post-untrap move events.
+        """
         with self.state_lock:
             self.cursor_on_android = False
             self._keyboard_focused_on_android = False
+            # Full kinematic wipe — eliminates accumulator state bleed between sessions.
+            self.android_x = 0
+            self.android_y = 0
+            self._subpx_x = 0.0
+            self._subpx_y = 0.0
+            self._ignore_move_count = 0
+            self._ignore_next_move.clear()
 
         # Stop click/scroll suppression first so the user regains full PC control
         self._stop_suppress_listener()
@@ -422,7 +494,7 @@ class MouseHookManager:
                 kb.update_suppression_state(False)
         except Exception as e:
             logger.error(f"Error releasing keyboard on untrap: {e}")
-        logger.info("Cursor untrapped. Click suppression OFF. Local control restored.")
+        logger.info("Cursor untrapped. Click suppression OFF. Local control restored. Kinematic state wiped.")
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -561,7 +633,26 @@ class MouseHookManager:
           X11 I/O (mouse_controller.position) is still performed OUTSIDE the lock,
           as blocking I/O under a mutex is forbidden by the design contract.
         """
-        # ── Single-shot ignore gate (threading.Event is lock-free) ────────────────────
+        # ── Phantom-event drain counter gate ─────────────────────────────────────────
+        # _ignore_move_count is set to _TELEPORT_IGNORE_COUNT by trap_cursor() under
+        # state_lock immediately before each WarpPointer call.  It drains one count
+        # per _on_move invocation, blocking the entire X11 phantom-event storm that
+        # precedes the warp taking effect.  Using an integer counter instead of a
+        # single-shot threading.Event absorbs ALL buffered pre-warp MotionNotify
+        # events (typically 2-4, capped at 6 for margin).
+        #
+        # NOTE: This check reads _ignore_move_count WITHOUT the state_lock because:
+        #   (a) it is only ever written by trap_cursor() (under lock) and here.
+        #   (b) the only risk is a torn read between trap() setting it to 6 and us
+        #       reading 0 — in which case we fall through to the jitter guard below,
+        #       which is a safe belt-and-suspenders fallback.
+        #   (c) Holding state_lock here on the hot-path (200 Hz) would invert our
+        #       lock-ordering contract (Event gate runs BEFORE the unified block).
+        if self._ignore_move_count > 0:
+            self._ignore_move_count -= 1
+            logger.debug(f"_on_move: phantom event suppressed (remaining={self._ignore_move_count}).")
+            return
+        # Legacy single-shot gate — kept for any caller that arms it directly.
         if self._ignore_next_move.is_set():
             self._ignore_next_move.clear()
             return
@@ -605,14 +696,17 @@ class MouseHookManager:
                 _sw = self._screen_width
                 _sh = self._screen_height
                 if abs(raw_dx) > _sw // 2 or abs(raw_dy) > _sh // 2:
-                    # Discard jitter and re-arm the ignore gate for the next event.
-                    # We must release the lock before calling .set() (Event is
-                    # lock-free, but we keep the pattern consistent).
-                    logger.debug(
-                        f"_on_move: discarding teleport-jitter event "
-                        f"(raw_dx={raw_dx}, raw_dy={raw_dy}). Re-arming ignore flag."
+                    # Belt-and-suspenders: a large delta that slipped past the
+                    # counter gate (e.g. counter exhausted before storm drained).
+                    # Re-arm the counter for one more event so the next phantom
+                    # is also caught, and log at WARNING so we can tune the count.
+                    self._ignore_move_count = max(self._ignore_move_count, 1)
+                    logger.warning(
+                        f"_on_move: teleport-jitter slipped past counter "
+                        f"(raw_dx={raw_dx}, raw_dy={raw_dy}). "
+                        f"Counter reset to {self._ignore_move_count}. "
+                        f"Consider increasing _TELEPORT_IGNORE_COUNT."
                     )
-                    self._ignore_next_move.set()
                     return  # exits the `with` block cleanly
 
                 # ── Sub-pixel accumulator pipeline (pure linear scaling) ───────
@@ -694,9 +788,20 @@ class MouseHookManager:
                 except Exception as e:
                     logger.error(f"Error in mouse move delta callback: {e}")
 
-            # Arm ignore flag BEFORE teleporting so the resulting X11 move event
-            # (triggered by mouse_controller.position assignment below) is swallowed.
-            self._ignore_next_move.set()
+            # Re-arm the phantom-event drain counter BEFORE every mid-session
+            # teleport.  This is the critical fix for the reconnect speed-doubling
+            # bug: previously only _ignore_next_move (single-shot) was re-armed
+            # here, absorbing exactly 1 phantom per tick.  X11 typically delivers
+            # 2-4 buffered MotionNotify events per WarpPointer, so the remaining
+            # 1-3 each injected the full edge→center delta (~960px raw × dpi_scale
+            # ≈ 3200 Android px) on every tick — appearing as compounding speed.
+            # Re-arming the integer counter ensures ALL phantoms are drained,
+            # consistent with how trap_cursor() arms it on session start.
+            # NOTE: We use max() to avoid shrinking a counter already in-flight
+            # (possible if a previous phantom storm hasn't fully drained yet).
+            self._ignore_move_count = max(
+                self._ignore_move_count, self._TELEPORT_IGNORE_COUNT
+            )
             # X11 I/O outside the lock — blocking calls under a mutex are forbidden.
             self.mouse_controller.position = (cx, cy)
 
