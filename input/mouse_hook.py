@@ -219,6 +219,24 @@ class MouseHookManager:
 
           The old (broken) formula was  96 / density_dpi = 0.3, which REDUCED the delta,
           forcing the user to swipe 10× farther to cross the screen.
+
+        BUG 3 FIX – TCP Reconnect DPI/Speed Explosion:
+          On a TCP drop + reconnect the Android client re-sends INIT before any input
+          events.  However, if the previous session ended with an unclean disconnect
+          (i.e. the cursor was still trapped on Android), cursor_on_android is still
+          True and the treadmill is still active with stale android_x/y accumulators.
+          The very first move event after reconnect uses the *old* dpi_scale (if INIT
+          hasn't propagated yet) and stale sub-pixel remainders from the previous
+          session, producing an enormous synthetic delta and the "violently fast"
+          cursor symptom.
+
+          Remediation – every INIT call is a session boundary; reset ALL treadmill
+          state unconditionally:
+            - android_x / android_y: reset virtual position to centre (0, 0).
+            - _subpx_x / _subpx_y: flush stale fractional remainder.
+            - _ignore_next_move: arm the ignore flag so the FIRST real move event
+              after reconnect (which may still carry a pre-teleport stale delta)
+              is discarded safely.
         """
         with self.state_lock:
             self._android_width = max(1, width)
@@ -231,13 +249,25 @@ class MouseHookManager:
             else:
                 # No DPI info from handshake: use identity (1.0) * speed_multiplier.
                 self.dpi_scale = speed_multiplier
-            # Reset accumulator when scale changes so stale fractional remainders
-            # from the old multiplier don't corrupt the first post-handshake event.
+
+            # ── BUG 3 FIX: full treadmill state reset on every TCP reconnect ────────────
+            # Reset virtual android position so the next session starts from (0, 0).
+            self.android_x = 0
+            self.android_y = 0
+            # Flush any stale sub-pixel fractional remainder from the previous session.
             self._subpx_x = 0.0
             self._subpx_y = 0.0
+
+        # Arm the ignore flag OUTSIDE the lock (threading.Event is thread-safe).
+        # This absorbs the first post-reconnect move event which may carry a large
+        # stale pre-teleport delta even if the _on_move jitter guard normally
+        # handles it — belt-and-suspenders safety on the reconnect boundary.
+        self._ignore_next_move.set()
+
         logger.info(
             f"Android virtual bounds updated to {width}x{height}, DPI {density_dpi} "
-            f"(dpi_scale = {self.dpi_scale:.3f}  [= {density_dpi}/96])"
+            f"(dpi_scale = {self.dpi_scale:.3f}  [= {density_dpi}/96]). "
+            f"Treadmill state fully reset for new session."
         )
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -512,12 +542,21 @@ class MouseHookManager:
             #
             # This achieves 1:1 physical-to-virtual travel distance while
             # preserving sub-pixel precision with zero velocity loss.
-            self._subpx_x += raw_dx * self.dpi_scale
-            self._subpx_y += raw_dy * self.dpi_scale
-            dx = int(self._subpx_x)
-            dy = int(self._subpx_y)
-            self._subpx_x -= dx
-            self._subpx_y -= dy
+            #
+            # BUG 3 FIX – accumulator race:
+            # _subpx_x/_subpx_y are read AND written here on the pynput listener
+            # thread.  set_android_resolution() resets them under state_lock from
+            # a different thread (the TCP receive thread).  We must hold state_lock
+            # around the entire read-accumulate-write cycle to prevent a TOCTOU
+            # race where set_android_resolution() clears the accumulator between
+            # our read and write, causing a stale value to survive the reset.
+            with self.state_lock:
+                self._subpx_x += raw_dx * self.dpi_scale
+                self._subpx_y += raw_dy * self.dpi_scale
+                dx = int(self._subpx_x)
+                dy = int(self._subpx_y)
+                self._subpx_x -= dx
+                self._subpx_y -= dy
 
             if dx != 0 or dy != 0:
                 with self.state_lock:

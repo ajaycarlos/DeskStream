@@ -286,6 +286,20 @@ class MouseAccessibilityService : AccessibilityService() {
                     is InputEvent.MouseMove   -> handleMouseMove(event.dx, event.dy)
                     is InputEvent.MouseClick  -> handleMouseClick(event.button, event.state)
                     is InputEvent.MouseScroll -> handleMouseScroll(event.dy)
+                    is InputEvent.ServiceStop -> {
+                        // ── Bug 1 Fix: InputBridgeService has stopped — halt rendering ──
+                        // 1. Remove the Choreographer callback immediately (not deferred).
+                        //    Using removeFrameCallback() is safer than relying on the
+                        //    isCursorActive flag, which only stops re-posting one frame later.
+                        isCursorActive = false
+                        isFrameCallbackScheduled = false
+                        Choreographer.getInstance().removeFrameCallback(frameCallback)
+                        // 2. Hide the cursor view. Do NOT call windowManager.removeView()
+                        //    here — the OS will invoke it naturally when this
+                        //    AccessibilityService is eventually destroyed.
+                        cursorView?.visibility = View.GONE
+                        Log.i(TAG, "ServiceStop received — cursor hidden, render loop paused.")
+                    }
                     else -> {}
                 }
             }

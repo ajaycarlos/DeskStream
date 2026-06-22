@@ -16,4 +16,11 @@ sealed class InputEvent {
         val state: SocketClient.ConnectionState,
         val error: String?
     ) : InputEvent()
+
+    /**
+     * Emitted by [com.deskstream.sync.service.InputBridgeService] during [onDestroy] to
+     * signal all UI consumers (e.g. MouseAccessibilityService) that the network bridge
+     * has stopped. Consumers should hide/pause any active rendering or input loops.
+     */
+    object ServiceStop : InputEvent()
 }

@@ -392,6 +392,10 @@ fun KvmDashboard() {
                     isServiceRunning = false
                     socketState = SocketClient.ConnectionState.DISCONNECTED
                     lastError = null
+                    
+                    // Prompt user to switch back to their normal keyboard
+                    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                    imm.showInputMethodPicker()
                 } else {
                     lastError = null
                     InputBridgeService.startService(

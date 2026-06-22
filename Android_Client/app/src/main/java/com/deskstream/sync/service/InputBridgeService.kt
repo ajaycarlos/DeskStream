@@ -165,6 +165,9 @@ class InputBridgeService : Service() {
     override fun onDestroy() {
         Log.i(TAG, "InputBridgeService destroyed")
         stopSocketClient()
+        // Signal UI consumers (e.g. MouseAccessibilityService) to hide their overlays
+        // BEFORE cancelling the scope, so the event is guaranteed in the buffer.
+        InputEventBus.tryEmit(InputEvent.ServiceStop)
         serviceScope.cancel()
         isServiceRunning = false
         super.onDestroy()
