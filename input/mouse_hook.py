@@ -303,6 +303,12 @@ class MouseHookManager:
             self.cursor_on_android = True
             self.android_x = 0
             self.android_y = 0
+            # Reset sub-pixel accumulator on every trap so stale fractional
+            # remainders from the previous session never corrupt the first event
+            # of the new session.  (The accumulator is always bounded to (-1, 1)
+            # during operation, but an explicit reset is cleaner and safer.)
+            self._subpx_x = 0.0
+            self._subpx_y = 0.0
             cx = self.center_x
             cy = self.center_y
 
@@ -461,6 +467,32 @@ class MouseHookManager:
         if cursor_on_android:
             raw_dx = x - cx
             raw_dy = y - cy
+
+            # ── Teleport-jitter guard ─────────────────────────────────────────
+            # When trap_cursor() teleports the physical cursor from the screen
+            # edge (e.g. x=1919) to the centre (e.g. x=960), X11 is async.
+            # pynput may fire 1–3 more move events with the OLD pre-teleport
+            # coordinates before the OS catches up.  _ignore_next_move is
+            # single-shot, so only the FIRST of these is absorbed.  The
+            # remaining events see raw_dx = 1919 - 960 = 959, which at
+            # dpi_scale ≈ 4.33 becomes 4152 Android pixels in one tick —
+            # the "violently fast on re-entry" bug.
+            #
+            # Guard: any single-tick delta exceeding half the screen dimension
+            # is physically impossible from real mouse hardware (a 1000-DPI
+            # mouse at 500 Hz can produce at most ~30px per event at sprint
+            # speed). Values this large are always stale pre-teleport jitter.
+            # We discard them and re-arm the ignore flag for the next event.
+            with self.state_lock:
+                _sw = self._screen_width
+                _sh = self._screen_height
+            if abs(raw_dx) > _sw // 2 or abs(raw_dy) > _sh // 2:
+                logger.debug(
+                    f"_on_move: discarding teleport-jitter event "
+                    f"(raw_dx={raw_dx}, raw_dy={raw_dy}). Re-arming ignore flag."
+                )
+                self._ignore_next_move.set()
+                return
 
             # ── Movement pipeline: pure linear scaling + sub-pixel accumulator ──
             #
