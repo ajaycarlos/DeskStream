@@ -15,9 +15,9 @@ object InputEventBus {
     private val _unlockEvents = MutableSharedFlow<Unit>(extraBufferCapacity = 8)
     val unlockEvents: SharedFlow<Unit> = _unlockEvents.asSharedFlow()
 
-    /** Emitted by MouseAccessibilityService once screen dimensions are known. */
-    private val _initEvents = MutableSharedFlow<Pair<Int,Int>>(extraBufferCapacity = 4)
-    val initEvents: SharedFlow<Pair<Int,Int>> = _initEvents.asSharedFlow()
+    /** Emitted by MouseAccessibilityService once screen dimensions and DPI are known. */
+    private val _initEvents = MutableSharedFlow<Triple<Int,Int,Int>>(extraBufferCapacity = 4)
+    val initEvents: SharedFlow<Triple<Int,Int,Int>> = _initEvents.asSharedFlow()
 
     /**
      * Emits a new KVM input event received from the PC host.
@@ -50,9 +50,9 @@ object InputEventBus {
 
     /**
      * Called by MouseAccessibilityService after onServiceConnected() to notify the
-     * PC host of the real device screen dimensions (INIT handshake).
+     * PC host of the real device screen dimensions and DPI (INIT handshake).
      */
-    suspend fun sendInitPacket(width: Int, height: Int) {
-        _initEvents.emit(Pair(width, height))
+    suspend fun sendInitPacket(width: Int, height: Int, densityDpi: Int) {
+        _initEvents.emit(Triple(width, height, densityDpi))
     }
 }

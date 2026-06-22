@@ -186,12 +186,12 @@ class SocketClient(
     }
 
     /**
-     * Send INIT:width:height to the PC Host so it can calibrate its virtual
-     * coordinate clamps to the real Android screen resolution.
+     * Send INIT:width:height:densityDpi to the PC Host so it can calibrate its virtual
+     * coordinate clamps and DPI scaling factor to the real Android screen.
      */
-    fun sendInitPacket(width: Int, height: Int) {
-        sendRawToHost("INIT:$width:$height\n")
-        Log.d(TAG, "INIT packet sent: INIT:$width:$height")
+    fun sendInitPacket(width: Int, height: Int, densityDpi: Int) {
+        sendRawToHost("INIT:$width:$height:$densityDpi\n")
+        Log.d(TAG, "INIT packet sent: INIT:$width:$height:$densityDpi")
     }
 
     /** Thread-safe raw write to the TCP output stream. */

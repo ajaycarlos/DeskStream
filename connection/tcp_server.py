@@ -242,17 +242,24 @@ class TCPHostServer:
                     logger.error(f"Error executing on_unlock_callback: {e}")
 
         elif msg.startswith("INIT:"):
-            # ── Bug 2 – INIT handshake: "INIT:width:height" ──────────────────
-            # Android sends its real screen resolution upon TCP connect so the
-            # Python host can clamp virtual coordinates to the real device bounds.
+            # ── Bug 2 – INIT handshake: "INIT:width:height:densityDpi" ──────────
+            # Android sends its real screen resolution and density DPI upon TCP
+            # connect so the Python host can clamp coordinates and scale sensitivity.
             try:
                 parts = msg.split(":")
-                if len(parts) == 3:
+                if len(parts) >= 4:
                     w = int(parts[1])
                     h = int(parts[2])
-                    logger.info(f"INIT handshake received: device resolution {w}x{h}")
+                    dpi = int(parts[3])
+                    logger.info(f"INIT handshake received: device resolution {w}x{h}, DPI {dpi}")
                     if self.on_device_info_callback:
-                        self.on_device_info_callback(w, h)
+                        self.on_device_info_callback(w, h, dpi)
+                elif len(parts) == 3:
+                    w = int(parts[1])
+                    h = int(parts[2])
+                    logger.info(f"INIT handshake received (legacy): device resolution {w}x{h}")
+                    if self.on_device_info_callback:
+                        self.on_device_info_callback(w, h, 0)
             except Exception as e:
                 logger.error(f"Failed to parse INIT packet '{msg}': {e}")
 

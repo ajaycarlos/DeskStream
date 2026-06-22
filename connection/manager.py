@@ -34,12 +34,12 @@ class ConnectionManager:
             except Exception as e:
                 logger.error(f"Error processing unlock callback in ConnectionManager: {e}")
 
-    def _on_device_info_received(self, width: int, height: int):
-        """Forwards Android device screen dimensions to the registered callback."""
-        logger.info(f"Device info received: {width}x{height}")
+    def _on_device_info_received(self, width: int, height: int, density_dpi: int = 0):
+        """Forwards Android device screen dimensions and DPI to the registered callback."""
+        logger.info(f"Device info received: {width}x{height}, DPI {density_dpi}")
         if self.on_device_info_callback:
             try:
-                self.on_device_info_callback(width, height)
+                self.on_device_info_callback(width, height, density_dpi)
             except Exception as e:
                 logger.error(f"Error processing device info callback: {e}")
 

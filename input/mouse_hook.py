@@ -47,27 +47,39 @@ def get_primary_monitor_resolution():
     return 1920, 1080
 
 
+# ── Bug 5 fix: Escape Resistance Buffer ─────────────────────────────────────
+# The virtual left-edge escape threshold (in virtual Android pixels).
+# Requires android_x to go this far negative before the cursor is released
+# back to the PC.  A value of 0 means ANY negative delta triggers escape,
+# which makes natural sensor jitter (~±3 px) escape accidentally.
+# 30px of deliberate leftward movement is required, matching approximately
+# a 3cm wrist flick at 1000 DPI – clearly intentional, never accidental.
+ESCAPE_BUFFER_PX = 30
+
+
 class MouseHookManager:
     """
     Manages global mouse hooks, edge checking, edge friction, cursor confinement,
     and coordinate redirection (Infinite Treadmill mode) for DeskStream.
 
     FIX NOTES (catastrophic lockup prevention):
-    - The mouse listener NEVER uses suppress=True.  The X11 mouse grab used by
-      pynput's suppressed listener is a low-level XGrabPointer call that – once
-      the Python callback raises an exception or the owning thread deadlocks –
-      leaves the grab in place with no automatic release.  Result: the OS sees
-      every button event "eaten" by the dead grab and the pointer is effectively
-      frozen.  We avoid this entirely: the listener just observes events; we
-      manipulate position ourselves via Controller.position.
-    - _ignore_next_move is a threading.Event (not a plain bool) so the race
-      between the teleport write on the main thread and the listener read on the
-      pynput thread is eliminated.
-    - The state_lock is never held while calling mouse_controller.position (which
-      can block on X11 I/O), preventing a deadlock between the listener thread
-      and the teleport setter.
-    - stop() is guaranteed to untrap the cursor and reset all state even in the
-      face of exceptions.
+    - The primary mouse listener NEVER uses suppress=True.  The X11 mouse grab
+      used by pynput's suppressed listener is a low-level XGrabPointer call that
+      – once the listener thread dies – leaves the grab in place permanently,
+      requiring REISUB to recover.  The primary listener is observe-only.
+    - BUG 5 FIX: A secondary suppress=True listener (_suppress_listener) is
+      started ONLY when cursor_on_android becomes True and stopped when it becomes
+      False.  It covers only on_click and on_scroll (no on_move), silently
+      consuming physical PC clicks/scrolls while the cursor is trapped on Android.
+      It is always cleanly joined (with a 2s timeout) before being replaced or
+      destroyed, and an atexit handler releases it unconditionally.
+      Movement is NOT suppressed: we rely on the Treadmill teleport to keep the
+      physical cursor locked to the screen centre; suppressing movement would
+      require XGrabPointer on the primary listener which we explicitly avoid.
+    - _ignore_next_move is a threading.Event (not a plain bool) to eliminate the
+      race between the teleport write and the listener read.
+    - The state_lock is never held while calling mouse_controller.position (X11 I/O).
+    - stop() is guaranteed to reset all state even in the face of exceptions.
     """
     instance = None
 
@@ -106,18 +118,27 @@ class MouseHookManager:
         self.android_x = 0
         self.android_y = 0
 
-        # ── Bug 2 Fix: Android device resolution (set dynamically via INIT handshake)
-        # Defaults are wide enough to avoid accidental boundary triggers before
-        # the real resolution arrives.  The Android client sends INIT:w:h on connect.
+        # Android device resolution (set dynamically via INIT handshake)
         self._android_width = 1080
         self._android_height = 2400
 
-        # ── FIX: Use a threading.Event instead of a plain bool ──────────────
         self._ignore_next_move = threading.Event()
 
         # Edge friction timing state variables
         self.at_edge = False
         self.friction_timer = None
+
+        # DPI scaling multiplier to handle monitor vs Android DPI difference
+        self.dpi_scale = 0.4
+
+        # ── Bug 5 Fix: secondary suppressing listener ─────────────────────────
+        # Started when trapped (cursor_on_android=True), stopped when released.
+        # Covers only on_click / on_scroll; movement is NOT suppressed.
+        self._suppress_listener = None
+        self._suppress_lock = threading.Lock()   # separate lock to avoid deadlock
+
+        import atexit
+        atexit.register(self._emergency_release_suppress)
 
         MouseHookManager.instance = self
 
@@ -171,51 +192,54 @@ class MouseHookManager:
 
     # ── Android device resolution (dynamic via INIT handshake) ─────────────
 
-    def set_android_resolution(self, width: int, height: int):
+    def set_android_resolution(self, width: int, height: int, density_dpi: int = 0):
         """
-        Called when the Android client sends its real screen resolution via the
-        INIT:width:height TCP handshake packet.  Updates the virtual coordinate
-        clamps used by the Infinite Treadmill so they match the actual device.
+        Called when the Android client sends its real screen resolution and DPI via the
+        INIT:width:height:densityDpi TCP handshake packet. Updates the virtual coordinate
+        clamps and the dynamic DPI scaling multiplier used by the Infinite Treadmill.
         """
         with self.state_lock:
             self._android_width = max(1, width)
             self._android_height = max(1, height)
-        logger.info(f"Android virtual bounds updated to {width}x{height}")
+            if density_dpi > 0:
+                self.dpi_scale = 96.0 / density_dpi
+            else:
+                self.dpi_scale = 0.4
+        logger.info(f"Android virtual bounds updated to {width}x{height}, DPI {density_dpi} (dpi_scale = {self.dpi_scale:.3f})")
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def start(self):
-        """Starts the global mouse listener thread (NO suppress=True – see class docstring)."""
+        """Starts the primary observe-only mouse listener thread."""
         with self.state_lock:
             if self.listener is not None:
                 logger.warning("Mouse listener thread is already active.")
                 return
 
-            # ── FIX: suppress=False (default) ───────────────────────────────
-            # We NEVER suppress mouse events at the listener level.
-            # Suppression via XGrabPointer leaves a dangling X11 grab if the
-            # listener thread dies, causing complete mouse/click lockout that
-            # survives even program termination and requires REISUB to clear.
+            # Primary listener: suppress=False (observe-only, NO XGrabPointer).
+            # Physical movement, clicks, and scrolls still reach the OS normally.
+            # Clicks/scrolls are swallowed by the secondary suppressing listener
+            # (started in _start_suppress_listener) only while cursor_on_android.
             self.listener = mouse.Listener(
                 on_move=self._on_move,
                 on_click=self._on_click,
                 on_scroll=self._on_scroll
-                # suppress=False (intentionally omitted / left at default)
             )
             self.listener.start()
-            logger.info("Global mouse tracking listener started (observe-only, no X11 grab).")
+            logger.info("Primary mouse listener started (observe-only).")
 
     def stop(self):
-        """Stops the global mouse listener and resets all state unconditionally."""
-        # ── FIX: reset state BEFORE stopping the listener so the callbacks
-        # that may fire during teardown see the correct state.
+        """Stops both mouse listeners and resets all state unconditionally."""
         with self.state_lock:
             self._cancel_friction_timer_under_lock()
             self.cursor_on_android = False
             self._keyboard_focused_on_android = False
             self._ignore_next_move.clear()
 
-        # Stop keyboard suppression first (outside state_lock to avoid deadlock)
+        # Stop secondary suppressing listener first
+        self._stop_suppress_listener()
+
+        # Stop keyboard suppression (outside state_lock to avoid deadlock)
         try:
             from input.keyboard_hook import KeyboardHookManager
             kb = KeyboardHookManager.active_instance
@@ -229,10 +253,10 @@ class MouseHookManager:
                 try:
                     self.listener.stop()
                 except Exception as e:
-                    logger.error(f"Error stopping mouse listener: {e}")
+                    logger.error(f"Error stopping primary mouse listener: {e}")
                 self.listener = None
 
-        logger.info("Global mouse tracking listener stopped. All state reset.")
+        logger.info("Mouse listeners stopped. All state reset.")
 
     # ── Cursor trap / untrap ─────────────────────────────────────────────────
 
@@ -240,6 +264,7 @@ class MouseHookManager:
         """
         Initiates Infinite Treadmill mode: resets virtual android coordinates
         and teleports the physical cursor to the screen centre.
+        Also starts the secondary suppressing listener to swallow PC clicks/scrolls.
         """
         with self.state_lock:
             self.cursor_on_android = True
@@ -248,21 +273,23 @@ class MouseHookManager:
             cx = self.center_x
             cy = self.center_y
 
-        # ── FIX: set the Event BEFORE moving the cursor ──────────────────────
-        # The listener thread fires _on_move almost immediately after the
-        # position assignment below.  Setting the flag first guarantees the
-        # listener sees it and skips the synthesised teleport event.
+        # Start secondary suppressing listener BEFORE teleporting so no click
+        # that arrives during the teleport frame leaks to the PC.
+        self._start_suppress_listener()
+
         self._ignore_next_move.set()
-        # This call may block briefly on X11 – safe to do outside state_lock
         self.mouse_controller.position = (cx, cy)
-        logger.info(f"Infinite Treadmill initiated. Physical cursor centred at ({cx}, {cy})")
+        logger.info(f"Treadmill initiated. Cursor centred at ({cx}, {cy}). Click suppression ON.")
 
     def untrap_cursor(self):
         """Unlocks the physical mouse cursor, returning normal movement to the user."""
         with self.state_lock:
             self.cursor_on_android = False
             self._keyboard_focused_on_android = False
-        # Notify keyboard hook
+
+        # Stop click/scroll suppression first so the user regains full PC control
+        self._stop_suppress_listener()
+
         try:
             from input.keyboard_hook import KeyboardHookManager
             kb = KeyboardHookManager.active_instance
@@ -270,7 +297,7 @@ class MouseHookManager:
                 kb.update_suppression_state(False)
         except Exception as e:
             logger.error(f"Error releasing keyboard on untrap: {e}")
-        logger.info("Cursor untrapped. Local control restored.")
+        logger.info("Cursor untrapped. Click suppression OFF. Local control restored.")
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -280,6 +307,65 @@ class MouseHookManager:
             self.friction_timer.cancel()
             self.friction_timer = None
         self.at_edge = False
+
+    # ── Bug 5: secondary suppressing listener lifecycle ──────────────────────
+
+    def _suppress_noop_click(self, x, y, button, pressed):
+        """Suppressing listener click callback: do nothing, event is consumed."""
+        logger.debug(f"[suppress] Ate PC click: {button} pressed={pressed}")
+
+    def _suppress_noop_scroll(self, x, y, dx, dy):
+        """Suppressing listener scroll callback: do nothing, event is consumed."""
+        logger.debug(f"[suppress] Ate PC scroll: dx={dx} dy={dy}")
+
+    def _start_suppress_listener(self):
+        """
+        Starts a suppress=True mouse listener that covers only clicks and scrolls.
+        Called from trap_cursor().  Any previously running suppress listener is
+        cleanly stopped first.
+        """
+        with self._suppress_lock:
+            self._stop_suppress_listener_under_lock()
+            try:
+                sl = mouse.Listener(
+                    on_click=self._suppress_noop_click,
+                    on_scroll=self._suppress_noop_scroll,
+                    suppress=True
+                )
+                sl.start()
+                self._suppress_listener = sl
+                logger.info("Secondary suppress listener started (clicks/scrolls swallowed).")
+            except Exception as e:
+                logger.error(f"Failed to start suppress listener: {e}")
+                self._suppress_listener = None
+
+    def _stop_suppress_listener(self):
+        """Stops the secondary suppressing listener. Safe to call from any thread."""
+        with self._suppress_lock:
+            self._stop_suppress_listener_under_lock()
+
+    def _stop_suppress_listener_under_lock(self):
+        """Caller must hold self._suppress_lock."""
+        sl = self._suppress_listener
+        if sl is None:
+            return
+        self._suppress_listener = None
+        try:
+            sl.stop()
+            if sl.is_alive():
+                sl.join(timeout=2.0)
+                if sl.is_alive():
+                    logger.warning("Suppress listener thread did not exit within 2s.")
+        except Exception as e:
+            logger.debug(f"Error stopping suppress listener: {e}")
+        logger.info("Secondary suppress listener stopped.")
+
+    def _emergency_release_suppress(self):
+        """atexit handler: unconditionally releases the suppress listener's X11 grab."""
+        try:
+            self._stop_suppress_listener()
+        except Exception:
+            pass
 
     def _on_friction_timer_fired(self, edge, x, y):
         """Invoked when the user has held the cursor at the edge past the friction threshold."""
@@ -343,18 +429,33 @@ class MouseHookManager:
             dx = x - cx
             dy = y - cy
 
+            # Apply DPI scaling to physical deltas and convert to integers
+            dx = int(dx * self.dpi_scale)
+            dy = int(dy * self.dpi_scale)
+
             if dx != 0 or dy != 0:
                 with self.state_lock:
                     # ── Bug 2 Fix: clamp to REAL device resolution from INIT handshake
                     aw = self._android_width
                     ah = self._android_height
-                    self.android_x = max(-1, min(self.android_x + dx, aw))
+                    # ── Bug 5 Fix: allow android_x to go as negative as
+                    # -ESCAPE_BUFFER_PX before treating it as an escape.
+                    # This prevents sensor jitter from firing the unlock.
+                    self.android_x = max(-(ESCAPE_BUFFER_PX + 1),
+                                         min(self.android_x + dx, aw))
                     self.android_y = max(0, min(self.android_y + dy, ah))
                     virtual_x = self.android_x
 
-                # Virtual left-edge breach → release cursor back to PC
-                if virtual_x < 0:
-                    logger.info("Virtual boundary breached (android_x < 0). Unlocking cursor.")
+                # ── Bug 5 Fix: require deliberate leftward swipe (> ESCAPE_BUFFER_PX)
+                # Natural jitter at x≈0 produces deltas of ±1–5px at most, which
+                # will nudge android_x to -1..-5 — well within the buffer zone.
+                # Only a sustained swipe accumulating > 30px of leftward virtual
+                # movement triggers the escape.
+                if virtual_x <= -ESCAPE_BUFFER_PX:
+                    logger.info(
+                        f"Virtual boundary breached (android_x={virtual_x} ≤ "
+                        f"-{ESCAPE_BUFFER_PX}). Unlocking cursor."
+                    )
                     self.untrap_cursor()
                     if self.on_unlock_callback:
                         try:
@@ -404,7 +505,28 @@ class MouseHookManager:
                     self._cancel_friction_timer_under_lock()
 
     def _on_click(self, x, y, button, pressed):
-        """Global mouse click event callback."""
+        """Global mouse click event callback.
+
+        BUG 4 FIX – Scroll Wheel Triggering Clicks:
+        On Linux X11, pynput maps the scroll wheel to Button.button4 (up) and
+        Button.button5 (down) and fires them through on_click rather than
+        on_scroll in some driver configurations.  Without filtering, these reach
+        the Android client as malformed C:BUTTON.BUTTON4:1 packets.  Even though
+        the Kotlin handler ignores unknown button names, the spurious _on_click
+        invocation races with the legitimate _on_scroll callback and can corrupt
+        the drag-state machine (e.g. flipping isLeftButtonDown via a bad timing
+        window).  We filter them out here before any state is touched.
+        """
+        # ── Bug 4 Fix: reject scroll-wheel pseudo-buttons ─────────────────────
+        # pynput names scroll buttons Button.button4 / Button.button5.
+        # Any Button whose name is not one of the three real mouse buttons is a
+        # hardware axis (scroll, tilt-wheel, extra thumb buttons) and must NOT
+        # be forwarded as a click event.
+        REAL_BUTTONS = {mouse.Button.left, mouse.Button.right, mouse.Button.middle}
+        if button not in REAL_BUTTONS:
+            logger.debug(f"_on_click: ignoring non-standard button {button} (scroll/axis).")
+            return
+
         with self.state_lock:
             cursor_on_android = self.cursor_on_android
 

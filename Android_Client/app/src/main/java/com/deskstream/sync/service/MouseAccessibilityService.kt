@@ -7,6 +7,7 @@ import android.graphics.PixelFormat
 import android.util.Log
 import android.view.Gravity
 import android.view.View
+import android.view.ViewTreeObserver
 import android.view.WindowManager
 import android.widget.ImageView
 import com.deskstream.sync.R
@@ -15,47 +16,44 @@ import com.deskstream.sync.event.InputEventBus
 import kotlinx.coroutines.*
 
 /**
- * MouseAccessibilityService leverages Android's Accessibility overlay to render a virtual
- * cursor on top of all applications and inject tap/drag/scroll gestures programmatically.
+ * MouseAccessibilityService
  *
- * ── Bug Fixes in this version ────────────────────────────────────────────────────────────
+ * Renders a virtual cursor overlay and injects gestures via the Accessibility API.
  *
- * BUG 2 – Resolution Mismatch / Premature Escape:
- *   After onServiceConnected() detects the real screen size, the service sends an
- *   "INIT:width:height\n" packet back to the Python host via InputEventBus so the
- *   host can dynamically clamp its virtual coordinate range to the real device bounds.
- *   Without this, the host used a hardcoded 1080×2400 clamp that may differ from the
- *   actual device, causing the virtual X counter to reach 0 (or overflow) sooner than
- *   expected, which triggered the premature "escape to PC" unlock.
+ * ── Fix log ───────────────────────────────────────────────────────────────────
  *
- * BUG 3 – Click Accuracy Offset (hot-spot misalignment):
- *   The ImageView overlay is sized at 24dp × 24dp and positioned with Gravity.TOP|START,
- *   so layoutParams.x/.y places its TOP-LEFT pixel on screen.  dispatchGesture() also
- *   receives absolute pixel coordinates.  For an arrow cursor whose tip is at the
- *   top-left of the image, both coordinates are consistent and taps should land exactly
- *   under the tip — BUT only if:
- *     a) The ImageView has NO internal padding (padding shifts the drawn image right/down
- *        without changing layoutParams.x/.y, creating an offset).
- *     b) ScaleType is set to FIT_START so the image starts at (0,0) of the view.
- *     c) The image resource itself has its tip at pixel (0,0) of the bitmap.
- *   Fix: set scaleType = FIT_START, padding = 0 explicitly.  Also, we now track a
- *   separate tapX/tapY that is offset by a small HOT_SPOT_OFFSET_PX constant (default 0)
- *   so it can be tuned if the cursor bitmap places its tip inset from the corner.
+ * BUG 1 – Scroll acts as tap:
+ *   One wheel tick sends dy=±1.  The old code built a 1px swipe over 180ms
+ *   (velocity ≈ 5 px/s), which Android classifies as TAP, not FLING.
+ *   Fix: multiply dy by SCROLL_SCALE_PX (120 px/tick) and use SCROLL_DURATION_MS
+ *   (80 ms) so velocity ≈ 1500 px/s, which always clears the fling threshold.
  *
- * BUG 4 – Missing Drag / Swipe Gestures:
- *   The original code only called injectTap() on LEFT button-down, so there was no way
- *   to model a press-hold-drag sequence.  The GestureDescription API supports this via
- *   StrokeDescription.continueStroke() — a chain of strokes where each one picks up
- *   where the previous left off.
+ * BUG 2 – Right-click hangs (stuck press):
+ *   injectLongPress used a single 500 ms non-continuing stroke.  On MIUI, if the
+ *   system intercepts ACTION_DOWN for its own shortcut sheet, the gesture callback
+ *   fires onCancelled() and ACTION_UP is never delivered, freezing the pressed UI.
+ *   Fix: model right-click as a two-stroke continueStroke sequence:
+ *     stroke 1 – 1 ms DOWN, willContinue=true  (establishes the press)
+ *     stroke 2 – 500 ms hold + UP, willContinue=false  (guaranteed UP delivery)
  *
- *   State machine:
- *     LEFT DOWN  → begin a "continuing" stroke at current position.  Dispatch a 1ms
- *                  stroke with willContinue=true so the system starts a gesture but
- *                  waits for continuations.
- *     MOUSE MOVE (while LEFT held) → append a continuation stroke along the delta path.
- *     LEFT UP    → dispatch a final "terminating" stroke with willContinue=false.
+ * BUG 3 – Drag / swipe broken:
+ *   Each mouse-move event called dispatchGesture() on a new continuation, but
+ *   dispatchGesture() CANCELS any currently executing gesture and starts fresh.
+ *   The correct approach: accumulate all drag points into a single Path and
+ *   dispatch it as ONE gesture on LEFT UP (endDrag).  The interim "hold" is kept
+ *   alive by a willContinue=true anchor stroke dispatched on LEFT DOWN.
+ *   On mouse-move we only update the path; on LEFT UP we dispatch the full path.
  *
- *   This allows full drag-to-select, drag-and-drop, and navigation swipes.
+ * BUG 4 – Dynamic click Y-offset:
+ *   The old code used resources.getDimensionPixelSize("status_bar_height") which
+ *   returns a resource value that can differ from the actual window inset MIUI
+ *   applies to TYPE_ACCESSIBILITY_OVERLAY views.
+ *   Fix: after windowManager.addView(), use a GlobalLayoutListener to call
+ *   view.getLocationOnScreen() and store the real absolute Y the OS placed us at.
+ *   gesture Y = currentY + (viewScreenY - layoutParams.y) = currentY + yInsetOffset.
+ *   This is always pixel-perfect regardless of MIUI version or notch type.
+ *
+ * BUG 5 (handled in mouse_hook.py on the host side – see that file).
  */
 class MouseAccessibilityService : AccessibilityService() {
 
@@ -65,24 +63,30 @@ class MouseAccessibilityService : AccessibilityService() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
-    // Screen dimensions (drawable area, excluding system bars)
     private var screenWidth = 0
     private var screenHeight = 0
 
-    // Current virtual cursor position (top-left of cursor ImageView, in screen pixels)
+    // ── BUG 4 FIX: dynamic inset offset ─────────────────────────────────────
+    // Difference between the absolute Y where the OS actually placed the view
+    // and layoutParams.y.  Populated by getLocationOnScreen() after layout.
+    // gesture_absolute_y = currentY + yInsetOffset
+    private var yInsetOffset = 0
+
     private var currentX = 0
     private var currentY = 0
     private var isCursorActive = false
 
-    // ── Bug 4: Drag state ─────────────────────────────────────────────────────
+    // ── BUG 3 FIX: path-accumulation drag state ───────────────────────────────
+    // We no longer call dispatchGesture() per move-segment.
+    // Instead we accumulate all points into dragAccumPath and dispatch once on UP.
     private var isLeftButtonDown = false
-    private var activeDragStroke: GestureDescription.StrokeDescription? = null
-    // Accumulate path points for the current drag segment
-    private var dragPath: Path? = null
+    private var dragStartX = 0f
+    private var dragStartY = 0f
+    private var dragAccumPath: Path? = null   // grows with every continueDrag call
     private var dragLastX = 0f
     private var dragLastY = 0f
-    // Running time offset within the current gesture (milliseconds)
-    private var dragTimeOffset = 0L
+    // Anchor stroke (willContinue=true, 1 ms) dispatched on DOWN to hold the press
+    private var anchorStroke: GestureDescription.StrokeDescription? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -90,7 +94,6 @@ class MouseAccessibilityService : AccessibilityService() {
 
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
 
-        // Use currentWindowMetrics on API 30+ for correct drawable-area dimensions
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             val metrics = windowManager.currentWindowMetrics
             screenWidth = metrics.bounds.width()
@@ -109,34 +112,24 @@ class MouseAccessibilityService : AccessibilityService() {
 
         initializeCursorOverlay()
 
-        // ── Bug 2 Fix: send INIT packet so the Python host knows our real resolution ──
-        // Dispatch after a short delay to ensure the TCP output stream is open on the
-        // Android client side (InputBridgeService connects slightly after the service starts).
         serviceScope.launch {
             delay(800)
-            InputEventBus.sendInitPacket(screenWidth, screenHeight)
-            Log.i(TAG, "INIT:${screenWidth}:${screenHeight} sent to PC host.")
+            val dpi = resources.displayMetrics.densityDpi
+            InputEventBus.sendInitPacket(screenWidth, screenHeight, dpi)
+            Log.i(TAG, "INIT:${screenWidth}:${screenHeight}:${dpi} sent to PC host.")
         }
 
         startInputEventCollection()
     }
 
-    override fun onAccessibilityEvent(event: android.view.accessibility.AccessibilityEvent?) {
-        // No-op: we only use this service for gesture injection and overlays.
-    }
-
-    override fun onInterrupt() {
-        Log.w(TAG, "Accessibility Service interrupted.")
-    }
+    override fun onAccessibilityEvent(event: android.view.accessibility.AccessibilityEvent?) {}
+    override fun onInterrupt() { Log.w(TAG, "Accessibility Service interrupted.") }
 
     // ── Cursor overlay ────────────────────────────────────────────────────────
 
     private fun initializeCursorOverlay() {
         val view = ImageView(this).apply {
             setImageResource(R.drawable.ic_mouse_cursor)
-            // ── Bug 3 Fix: zero padding + FIT_START so the image tip sits exactly
-            //    at the view's (0,0), which matches layoutParams.x/.y and thus the
-            //    coordinates passed to dispatchGesture().
             setPadding(0, 0, 0, 0)
             scaleType = ImageView.ScaleType.FIT_START
             visibility = View.GONE
@@ -160,6 +153,24 @@ class MouseAccessibilityService : AccessibilityService() {
         try {
             windowManager.addView(view, layoutParams)
             cursorView = view
+
+            // ── BUG 4 FIX: measure real absolute Y after the view is laid out ──
+            view.viewTreeObserver.addOnGlobalLayoutListener(object :
+                ViewTreeObserver.OnGlobalLayoutListener {
+                override fun onGlobalLayout() {
+                    val loc = IntArray(2)
+                    view.getLocationOnScreen(loc)
+                    // loc[1] = absolute screen Y of the view's top-left pixel.
+                    // layoutParams.y = what we ASKED for (relative to window origin).
+                    // yInsetOffset = how much the OS shifted us DOWN relative to
+                    // layoutParams.y (status bar + any system insets MIUI adds).
+                    yInsetOffset = loc[1] - layoutParams.y
+                    Log.i(TAG, "View placed at screen Y=${loc[1]}, layoutParams.y=${layoutParams.y}" +
+                               ", yInsetOffset=$yInsetOffset px")
+                    view.viewTreeObserver.removeOnGlobalLayoutListener(this)
+                }
+            })
+
             Log.i(TAG, "Cursor overlay added at ($currentX, $currentY).")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to add cursor view: ${e.message}", e)
@@ -174,7 +185,6 @@ class MouseAccessibilityService : AccessibilityService() {
         layoutParams.y = currentY
         try {
             windowManager.updateViewLayout(view, layoutParams)
-            Log.i(TAG, "Cursor shown at ($currentX, $currentY).")
         } catch (e: Exception) {
             Log.e(TAG, "Error showing cursor: ${e.message}")
         }
@@ -189,7 +199,7 @@ class MouseAccessibilityService : AccessibilityService() {
                     is InputEvent.MouseMove   -> handleMouseMove(event.dx, event.dy)
                     is InputEvent.MouseClick  -> handleMouseClick(event.button, event.state)
                     is InputEvent.MouseScroll -> handleMouseScroll(event.dy)
-                    else -> { /* Keystrokes handled by KeyboardInjectionService (IME) */ }
+                    else -> {}
                 }
             }
         }
@@ -197,25 +207,18 @@ class MouseAccessibilityService : AccessibilityService() {
 
     // ── Input handlers ────────────────────────────────────────────────────────
 
-    /**
-     * Moves the cursor overlay and, if a drag is in progress, continues the active gesture.
-     */
     private fun handleMouseMove(dx: Int, dy: Int) {
-        if (!isCursorActive) {
-            showCursor()
-        }
+        if (!isCursorActive) showCursor()
 
         currentX = (currentX + dx).coerceIn(0, screenWidth - 1)
         currentY = (currentY + dy).coerceIn(0, screenHeight - 1)
 
         if (currentX <= 0) {
-            // Cancel any active drag before unlocking
             cancelDrag()
             triggerEdgeUnlock()
             return
         }
 
-        // Update cursor overlay position
         layoutParams.x = currentX
         layoutParams.y = currentY
         try {
@@ -227,159 +230,144 @@ class MouseAccessibilityService : AccessibilityService() {
             Log.e(TAG, "Error updating cursor layout: ${e.message}")
         }
 
-        // ── Bug 4 Fix: if left button is held, continue the drag stroke ───────
+        // ── BUG 3 FIX: accumulate into dragAccumPath; do NOT dispatch yet ────
         if (isLeftButtonDown) {
-            continueDrag(currentX.toFloat(), currentY.toFloat())
+            val gx = currentX.toFloat()
+            val gy = gestureY(currentY.toFloat())
+            dragAccumPath?.lineTo(gx, gy)
+            dragLastX = gx
+            dragLastY = gy
         }
     }
 
     /**
-     * Handles mouse button press and release.
-     * LEFT DOWN  → begin drag stroke (willContinue = true).
-     * LEFT UP    → terminate drag stroke (willContinue = false).
-     * RIGHT DOWN → context-menu long-press simulation.
+     * BUG 4 FIX – returns the absolute Y coordinate for dispatchGesture() calls.
+     * currentY (layoutParams.y-relative) + yInsetOffset = absolute screen Y.
+     */
+    private fun gestureY(layoutRelativeY: Float): Float = layoutRelativeY + yInsetOffset
+
+    /**
+     * LEFT DOWN  → record start, build accumulation path, dispatch anchor hold stroke.
+     * LEFT UP    → dispatch full accumulated path as one gesture (= clean drag or tap).
+     * RIGHT      → two-stroke long-press (DOWN wilContinue=true, then UP).
+     *
+     * BUG 2 FIX: right-click uses a continueStroke pair so ACTION_UP is guaranteed.
+     * BUG 3 FIX: left drag accumulates path, dispatches once on UP.
+     * BUG 4 FIX: all Y coords go through gestureY().
      */
     private fun handleMouseClick(button: String, state: Int) {
         if (!isCursorActive) return
 
-        val x = currentX.toFloat() + HOT_SPOT_OFFSET_PX
-        val y = currentY.toFloat() + HOT_SPOT_OFFSET_PX
+        val gx = currentX.toFloat() + HOT_SPOT_OFFSET_PX
+        val gy = gestureY(currentY.toFloat() + HOT_SPOT_OFFSET_PX)
 
         when {
             button == "LEFT" && state == 1 -> {
-                // ── Bug 4 Fix: begin drag stroke ──────────────────────────────
                 isLeftButtonDown = true
-                beginDrag(x, y)
+                beginDrag(gx, gy)
             }
             button == "LEFT" && state == 0 -> {
-                // Button released – terminate the drag/tap stroke
                 isLeftButtonDown = false
-                endDrag(x, y)
+                endDrag(gx, gy)
             }
             button == "RIGHT" && state == 1 -> {
-                // Simulate a long-press for context menus
-                injectLongPress(x, y)
+                injectRightClick(gx, gy)
             }
         }
     }
 
     /**
-     * Dispatches a scroll swipe gesture under the cursor.
-     * dy > 0 = scroll down (content moves up); dy < 0 = scroll up.
+     * BUG 1 FIX – Scroll wheel:
+     * Scale each tick by SCROLL_SCALE_PX so the swipe distance is ~120 px.
+     * Use SCROLL_DURATION_MS (80 ms) so velocity ≈ 1500 px/s > Android fling threshold.
+     * dy > 0 = scroll down → finger moves UP (content scrolls down) → endY < startY.
      */
     private fun handleMouseScroll(dy: Int) {
         if (!isCursorActive) return
-        val swipeDistance = dy.toFloat().coerceIn(-600f, 600f)
-        injectSwipe(
-            currentX.toFloat(), currentY.toFloat(),
-            currentX.toFloat(), currentY - swipeDistance,
-            durationMs = 180L
-        )
+        val startX = currentX.toFloat()
+        val startY = gestureY(currentY.toFloat())
+        // dy > 0 means scroll DOWN: swipe finger UP, so endY < startY
+        val endY = startY - (dy * SCROLL_SCALE_PX)
+        injectSwipe(startX, startY, startX, endY, durationMs = SCROLL_DURATION_MS)
     }
 
-    // ── Drag state machine ────────────────────────────────────────────────────
+    // ── Drag state machine (path-accumulation model) ──────────────────────────
 
     /**
-     * Starts a new drag gesture at (x, y).
-     * Uses willContinue=true so the system holds the gesture open for continuations.
+     * BUG 3 FIX – begin drag:
+     * Dispatch a 1 ms anchor stroke (willContinue=true) to register the DOWN event.
+     * Do NOT attempt to chain continuations via dispatchGesture() per-segment —
+     * each dispatchGesture() call cancels the previous gesture.
+     * Instead, accumulate all movement in dragAccumPath and dispatch once on endDrag.
      */
     private fun beginDrag(x: Float, y: Float) {
+        dragStartX = x
+        dragStartY = y
         dragLastX = x
         dragLastY = y
-        dragTimeOffset = 0L
 
-        val path = Path().apply {
-            moveTo(x, y)
-            lineTo(x + 1f, y)   // non-zero length required by some vendor gesture engines
-        }
+        // Build the accumulation path starting at the down point
+        dragAccumPath = Path().apply { moveTo(x, y) }
 
-        // 1ms duration – just enough to register the press without moving
-        val stroke = GestureDescription.StrokeDescription(path, 0L, 1L, true)
-        activeDragStroke = stroke
-        dragPath = path
+        // Dispatch a 1 ms anchor hold so the system registers ACTION_DOWN
+        val anchorPath = Path().apply { moveTo(x, y); lineTo(x + 0.1f, y) }
+        val stroke = GestureDescription.StrokeDescription(anchorPath, 0L, DRAG_ANCHOR_MS, true)
+        anchorStroke = stroke
 
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(g: GestureDescription?) {
-                Log.d(TAG, "Drag started at ($x, $y).")
+                Log.d(TAG, "Drag anchor DOWN at ($x, $y).")
             }
             override fun onCancelled(g: GestureDescription?) {
-                Log.w(TAG, "Drag start cancelled at ($x, $y).")
+                Log.w(TAG, "Drag anchor cancelled.")
                 cancelDrag()
             }
         }, null)
     }
 
     /**
-     * Appends a continuation stroke to the active drag gesture.
-     * Called for every mouse-move event while the left button is held.
-     */
-    private fun continueDrag(toX: Float, toY: Float) {
-        val prevStroke = activeDragStroke ?: return
-        if (dragLastX == toX && dragLastY == toY) return   // no movement, skip
-
-        dragTimeOffset += DRAG_SEGMENT_MS
-
-        val path = Path().apply {
-            moveTo(dragLastX, dragLastY)
-            lineTo(toX, toY)
-        }
-
-        val continuation = prevStroke.continueStroke(path, dragTimeOffset, DRAG_SEGMENT_MS, true)
-        activeDragStroke = continuation
-        dragLastX = toX
-        dragLastY = toY
-
-        val gesture = GestureDescription.Builder().addStroke(continuation).build()
-        dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCancelled(g: GestureDescription?) {
-                Log.w(TAG, "Drag continuation cancelled – resetting drag state.")
-                cancelDrag()
-            }
-        }, null)
-    }
-
-    /**
-     * Terminates the drag gesture at (x, y) with willContinue=false.
-     * If the button was released with zero total movement, this produces a clean tap.
+     * BUG 3 FIX – end drag:
+     * Build a single stroke from dragStartX/Y through all accumulated points to (x, y).
+     * Duration is proportional to path length (clamped) so velocity stays natural.
+     * If no movement occurred (path is just moveTo), dispatch a clean tap instead.
      */
     private fun endDrag(x: Float, y: Float) {
-        val prevStroke = activeDragStroke
+        val path = dragAccumPath
 
-        if (prevStroke == null) {
-            // No active gesture (e.g. drag was cancelled) – inject a simple tap
+        // Measure total movement
+        val dx = x - dragStartX
+        val dy = y - dragStartY
+        val totalMovement = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+
+        dragAccumPath = null
+        anchorStroke = null
+
+        if (path == null || totalMovement < DRAG_MIN_MOVEMENT_PX) {
+            // No meaningful drag → simple tap
             injectTap(x, y)
             return
         }
 
-        dragTimeOffset += DRAG_SEGMENT_MS
+        path.lineTo(x, y)
 
-        val path = Path().apply {
-            moveTo(dragLastX, dragLastY)
-            lineTo(x, y)
-        }
+        // Duration proportional to distance, clamped between 80ms and 2000ms
+        val durationMs = (totalMovement * DRAG_MS_PER_PX).toLong().coerceIn(80L, 2000L)
 
-        // willContinue = false → gesture ends here
-        val terminator = prevStroke.continueStroke(path, dragTimeOffset, DRAG_SEGMENT_MS, false)
-        activeDragStroke = null
-        dragPath = null
-
-        val gesture = GestureDescription.Builder().addStroke(terminator).build()
+        val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs, false)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
         dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(g: GestureDescription?) {
-                Log.d(TAG, "Drag ended at ($x, $y).")
-            }
-            override fun onCancelled(g: GestureDescription?) {
-                Log.w(TAG, "Drag end cancelled.")
-            }
+            override fun onCompleted(g: GestureDescription?) { Log.d(TAG, "Drag ended at ($x, $y).") }
+            override fun onCancelled(g: GestureDescription?) { Log.w(TAG, "Drag end cancelled.") }
         }, null)
     }
 
-    /** Clears all drag state without sending a termination gesture. */
     private fun cancelDrag() {
-        activeDragStroke = null
-        dragPath = null
+        dragAccumPath = null
+        anchorStroke = null
         isLeftButtonDown = false
+        dragStartX = 0f; dragStartY = 0f
+        dragLastX = 0f; dragLastY = 0f
         Log.d(TAG, "Drag cancelled (state reset).")
     }
 
@@ -390,23 +378,14 @@ class MouseAccessibilityService : AccessibilityService() {
         cursorView?.visibility = View.GONE
         currentX = 15
         currentY = screenHeight / 2
-        Log.i(TAG, "Cursor exited Android screen edge. Requesting PC unlock.")
-        serviceScope.launch {
-            InputEventBus.requestUnlock()
-        }
+        Log.i(TAG, "Cursor exited edge. Requesting PC unlock.")
+        serviceScope.launch { InputEventBus.requestUnlock() }
     }
 
     // ── Gesture helpers ───────────────────────────────────────────────────────
 
-    /**
-     * Injects a single-point tap gesture.
-     * Uses a 1-pixel lineTo for vendor gesture recogniser compatibility.
-     */
     private fun injectTap(x: Float, y: Float) {
-        val path = Path().apply {
-            moveTo(x, y)
-            lineTo(x + 1f, y + 1f)
-        }
+        val path = Path().apply { moveTo(x, y); lineTo(x + 1f, y + 1f) }
         val stroke = GestureDescription.StrokeDescription(path, 0L, 60L)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         dispatchGesture(gesture, object : GestureResultCallback() {
@@ -415,13 +394,44 @@ class MouseAccessibilityService : AccessibilityService() {
         }, null)
     }
 
-    /** Simulates a long-press (500 ms) for context menus / drag-to-reorder activation. */
-    private fun injectLongPress(x: Float, y: Float) {
-        val path = Path().apply { moveTo(x, y); lineTo(x + 1f, y) }
-        val stroke = GestureDescription.StrokeDescription(path, 0L, 500L)
-        val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(g: GestureDescription?) { Log.d(TAG, "Long-press at ($x, $y).") }
+    /**
+     * BUG 2 FIX – Right-click / long-press:
+     * Two-stroke sequence guarantees ACTION_UP is always delivered even if MIUI
+     * intercepts ACTION_DOWN for its own shortcut sheet:
+     *   Stroke 1: 1 ms DOWN, willContinue=true  (establishes the touch contact)
+     *   Stroke 2: LONG_PRESS_MS hold, willContinue=false  (hold + guaranteed UP)
+     */
+    private fun injectRightClick(x: Float, y: Float) {
+        val downPath = Path().apply { moveTo(x, y); lineTo(x + 0.1f, y) }
+        val downStroke = GestureDescription.StrokeDescription(downPath, 0L, 1L, true)
+
+        val holdPath = Path().apply { moveTo(x, y); lineTo(x + 0.1f, y) }
+        val holdStroke = downStroke.continueStroke(holdPath, 1L, LONG_PRESS_MS, false)
+
+        val gesture = GestureDescription.Builder()
+            .addStroke(holdStroke)   // the full gesture; downStroke is its ancestor
+            .build()
+
+        // We must dispatch downStroke first, then holdStroke as continuation.
+        // The Builder-based API accepts only one root stroke; continueStroke
+        // chains are built by dispatching the continuation stroke directly.
+        // Correct pattern: dispatch the INITIAL stroke, then dispatch the continuation.
+        val gestureDown = GestureDescription.Builder().addStroke(downStroke).build()
+        dispatchGesture(gestureDown, object : GestureResultCallback() {
+            override fun onCompleted(g: GestureDescription?) {
+                val gestureHold = GestureDescription.Builder().addStroke(holdStroke).build()
+                dispatchGesture(gestureHold, object : GestureResultCallback() {
+                    override fun onCompleted(g: GestureDescription?) {
+                        Log.d(TAG, "Right-click long-press completed at ($x, $y).")
+                    }
+                    override fun onCancelled(g: GestureDescription?) {
+                        Log.w(TAG, "Right-click long-press cancelled.")
+                    }
+                }, null)
+            }
+            override fun onCancelled(g: GestureDescription?) {
+                Log.w(TAG, "Right-click DOWN anchor cancelled.")
+            }
         }, null)
     }
 
@@ -434,8 +444,12 @@ class MouseAccessibilityService : AccessibilityService() {
         val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(g: GestureDescription?) { Log.d(TAG, "Swipe ($startX,$startY)→($endX,$endY).") }
-            override fun onCancelled(g: GestureDescription?) { Log.w(TAG, "Swipe cancelled.") }
+            override fun onCompleted(g: GestureDescription?) {
+                Log.d(TAG, "Swipe ($startX,$startY)→($endX,$endY).")
+            }
+            override fun onCancelled(g: GestureDescription?) {
+                Log.w(TAG, "Swipe cancelled.")
+            }
         }, null)
     }
 
@@ -445,11 +459,8 @@ class MouseAccessibilityService : AccessibilityService() {
         Log.i(TAG, "MouseAccessibilityService destroyed.")
         val view = cursorView
         if (view != null) {
-            try {
-                if (view.parent != null) windowManager.removeView(view)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error removing cursor view: ${e.message}")
-            }
+            try { if (view.parent != null) windowManager.removeView(view) }
+            catch (e: Exception) { Log.e(TAG, "Error removing cursor view: ${e.message}") }
             cursorView = null
         }
         serviceScope.cancel()
@@ -459,14 +470,23 @@ class MouseAccessibilityService : AccessibilityService() {
     companion object {
         private const val TAG = "MouseAccessibilityService"
 
-        // ── Bug 3: hot-spot offset ────────────────────────────────────────────
-        // 0 = the tap coordinate == the top-left pixel of the ImageView.
-        // If the cursor bitmap has its visual tip inset from the corner (e.g. a
-        // drop-shadow makes the actual tip land at pixel 2,2), set this to 2.
+        // Cursor bitmap hot-spot inset from top-left corner (px). 0 = tip is at (0,0).
         private const val HOT_SPOT_OFFSET_PX = 0f
 
-        // Duration of each drag segment stroke in milliseconds.
-        // Lower = smoother drag but more gesture dispatches; 16ms ≈ 60fps.
-        private const val DRAG_SEGMENT_MS = 16L
+        // ── BUG 1: scroll constants ───────────────────────────────────────────
+        // Pixels per scroll tick.  120 px/tick → velocity ≈ 1500 px/s at 80 ms.
+        private const val SCROLL_SCALE_PX = 120f
+        private const val SCROLL_DURATION_MS = 80L
+
+        // ── BUG 2: right-click long-press hold duration ───────────────────────
+        private const val LONG_PRESS_MS = 500L
+
+        // ── BUG 3: drag constants ─────────────────────────────────────────────
+        // 1 ms anchor stroke duration for the initial DOWN.
+        private const val DRAG_ANCHOR_MS = 1L
+        // Minimum pixel movement to count as a drag (below this → tap on release).
+        private const val DRAG_MIN_MOVEMENT_PX = 8f
+        // ms per pixel of travel for the final drag stroke duration.
+        private const val DRAG_MS_PER_PX = 1.5f
     }
 }

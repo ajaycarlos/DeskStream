@@ -78,10 +78,10 @@ class DeskStreamApp:
         # 3. Activate keyboard suppression and redirect keystrokes
         self.keyboard_hook.is_trapped = True
 
-    def _handle_device_info(self, width: int, height: int):
+    def _handle_device_info(self, width: int, height: int, density_dpi: int = 0):
         """Callback fired when the Android client sends its INIT resolution packet."""
-        logger.info(f"Android device resolution received: {width}x{height}. Updating treadmill clamps.")
-        self.mouse_hook.set_android_resolution(width, height)
+        logger.info(f"Android device resolution received: {width}x{height}, DPI {density_dpi}. Updating treadmill clamps.")
+        self.mouse_hook.set_android_resolution(width, height, density_dpi)
 
     def _handle_mouse_move(self, dx, dy):
         """Callback fired to forward trapped mouse relative coordinates."""
@@ -135,18 +135,35 @@ class DeskStreamApp:
         logger.info(f"Resolution updated to {width}x{height}.")
 
     def start(self):
-        """Starts the background services, tray icon, and input listeners."""
+        """Starts the background services, tray icon, and input listeners.
+
+        BUG 1 FIX – Startup Order Lockup:
+        Input hooks MUST be started before the TCP server begins accepting
+        connections.  If the Android client connects before pynput listeners
+        are alive, the INIT handshake fires _handle_device_info and potentially
+        triggers keyboard-suppression state changes (update_suppression_state)
+        while KeyboardHookManager.listener is still None.  The resulting
+        race condition leaves the X11 keyboard grab in a half-initialised state
+        that manifests as an I-beam text cursor and dead keyboard/clicks.
+
+        Correct order:
+          1. Start mouse + keyboard hooks (pynput listeners now alive)
+          2. Start network services (TCP server can now safely accept clients)
+          3. Start system tray
+        """
         self.running = True
-        
-        # 1. Start network server pipelines (TCP and UDP/ADB)
-        self.connection.start_services()
-        
-        # 2. Start global mouse hook trackers
+
+        # 1. Start global mouse hook FIRST – pynput listeners must be alive
+        #    before any TCP client can trigger input-suppression callbacks.
         self.mouse_hook.start()
+
+        # 2. Start network server pipelines (TCP and UDP/ADB)
+        #    Safe now: pynput is fully initialised and ready.
+        self.connection.start_services()
 
         # 3. Start System Tray icon daemon
         self.tray.start()
-        
+
         logger.info("DeskStream Sync Host application fully initialized.")
 
     def stop(self):
