@@ -88,6 +88,7 @@ class MouseAccessibilityService : AccessibilityService() {
     private var screenHeight = 0
 
     // ── BUG 4 FIX: dynamic inset offset ─────────────────────────────────────
+    @Volatile
     private var yInsetOffset = 0
 
     // ── RENDER BUG 1 FIX: Choreographer-decoupled cursor position ─────────
@@ -107,6 +108,7 @@ class MouseAccessibilityService : AccessibilityService() {
     // Set to 1.0f to disable interpolation (instant snapping).
     private val LERP_FACTOR = 0.70f
 
+    @Volatile
     private var isCursorActive = false
     private var isFrameCallbackScheduled = false
 
@@ -120,6 +122,7 @@ class MouseAccessibilityService : AccessibilityService() {
         set(v) = targetY.set(v)
 
     // ── BUG 3 FIX: path-accumulation drag state ───────────────────────────────
+    private val dragLock = Any()
     private var isLeftButtonDown = false
     private var dragStartX = 0f
     private var dragStartY = 0f
@@ -280,7 +283,7 @@ class MouseAccessibilityService : AccessibilityService() {
     // ── Event collection ──────────────────────────────────────────────────────
 
     private fun startInputEventCollection() {
-        serviceScope.launch {
+        serviceScope.launch(Dispatchers.Default) {
             InputEventBus.events.collect { event ->
                 when (event) {
                     is InputEvent.MouseMove   -> handleMouseMove(event.dx, event.dy)
@@ -288,16 +291,18 @@ class MouseAccessibilityService : AccessibilityService() {
                     is InputEvent.MouseScroll -> handleMouseScroll(event.dy)
                     is InputEvent.ServiceStop -> {
                         // ── Bug 1 Fix: InputBridgeService has stopped — halt rendering ──
-                        // 1. Remove the Choreographer callback immediately (not deferred).
-                        //    Using removeFrameCallback() is safer than relying on the
-                        //    isCursorActive flag, which only stops re-posting one frame later.
-                        isCursorActive = false
-                        isFrameCallbackScheduled = false
-                        Choreographer.getInstance().removeFrameCallback(frameCallback)
-                        // 2. Hide the cursor view. Do NOT call windowManager.removeView()
-                        //    here — the OS will invoke it naturally when this
-                        //    AccessibilityService is eventually destroyed.
-                        cursorView?.visibility = View.GONE
+                        withContext(Dispatchers.Main) {
+                            // 1. Remove the Choreographer callback immediately (not deferred).
+                            //    Using removeFrameCallback() is safer than relying on the
+                            //    isCursorActive flag, which only stops re-posting one frame later.
+                            isCursorActive = false
+                            isFrameCallbackScheduled = false
+                            Choreographer.getInstance().removeFrameCallback(frameCallback)
+                            // 2. Hide the cursor view. Do NOT call windowManager.removeView()
+                            //    here — the OS will invoke it naturally when this
+                            //    AccessibilityService is eventually destroyed.
+                            cursorView?.visibility = View.GONE
+                        }
                         Log.i(TAG, "ServiceStop received — cursor hidden, render loop paused.")
                     }
                     else -> {}
@@ -333,12 +338,14 @@ class MouseAccessibilityService : AccessibilityService() {
         }
 
         // ── BUG 3 FIX: accumulate into dragAccumPath; do NOT dispatch yet ────
-        if (isLeftButtonDown) {
-            val gx = newX.toFloat()
-            val gy = gestureY(newY.toFloat())
-            dragAccumPath?.lineTo(gx, gy)
-            dragLastX = gx
-            dragLastY = gy
+        synchronized(dragLock) {
+            if (isLeftButtonDown) {
+                val gx = newX.toFloat()
+                val gy = gestureY(newY.toFloat())
+                dragAccumPath?.lineTo(gx, gy)
+                dragLastX = gx
+                dragLastY = gy
+            }
         }
     }
 
@@ -360,11 +367,11 @@ class MouseAccessibilityService : AccessibilityService() {
 
         when {
             button == "LEFT" && state == 1 -> {
-                isLeftButtonDown = true
+                synchronized(dragLock) { isLeftButtonDown = true }
                 beginDrag(gx, gy)
             }
             button == "LEFT" && state == 0 -> {
-                isLeftButtonDown = false
+                synchronized(dragLock) { isLeftButtonDown = false }
                 endDrag(gx, gy)
             }
             button == "RIGHT" && state == 1 -> {
@@ -393,27 +400,29 @@ class MouseAccessibilityService : AccessibilityService() {
      * Dispatch a 1 ms anchor stroke (willContinue=true) to register the DOWN event.
      */
     private fun beginDrag(x: Float, y: Float) {
-        dragStartX = x
-        dragStartY = y
-        dragLastX = x
-        dragLastY = y
+        synchronized(dragLock) {
+            dragStartX = x
+            dragStartY = y
+            dragLastX = x
+            dragLastY = y
 
-        dragAccumPath = Path().apply { moveTo(x, y) }
+            dragAccumPath = Path().apply { moveTo(x, y) }
 
-        val anchorPath = Path().apply { moveTo(x, y); lineTo(x + 0.1f, y) }
-        val stroke = GestureDescription.StrokeDescription(anchorPath, 0L, DRAG_ANCHOR_MS, true)
-        anchorStroke = stroke
+            val anchorPath = Path().apply { moveTo(x, y); lineTo(x + 0.1f, y) }
+            val stroke = GestureDescription.StrokeDescription(anchorPath, 0L, DRAG_ANCHOR_MS, true)
+            anchorStroke = stroke
 
-        val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(g: GestureDescription?) {
-                Log.d(TAG, "Drag anchor DOWN at ($x, $y).")
-            }
-            override fun onCancelled(g: GestureDescription?) {
-                Log.w(TAG, "Drag anchor cancelled.")
-                cancelDrag()
-            }
-        }, null)
+            val gesture = GestureDescription.Builder().addStroke(stroke).build()
+            dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(g: GestureDescription?) {
+                    Log.d(TAG, "Drag anchor DOWN at ($x, $y).")
+                }
+                override fun onCancelled(g: GestureDescription?) {
+                    Log.w(TAG, "Drag anchor cancelled.")
+                    cancelDrag()
+                }
+            }, null)
+        }
     }
 
     /**
@@ -431,43 +440,47 @@ class MouseAccessibilityService : AccessibilityService() {
      * The lower bound (80 ms) is kept so micro-taps are not classified as flings.
      */
     private fun endDrag(x: Float, y: Float) {
-        val path = dragAccumPath
+        synchronized(dragLock) {
+            val path = dragAccumPath
 
-        val dx = x - dragStartX
-        val dy = y - dragStartY
-        val totalMovement = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+            val dx = x - dragStartX
+            val dy = y - dragStartY
+            val totalMovement = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
 
-        dragAccumPath = null
-        anchorStroke = null
+            dragAccumPath = null
+            anchorStroke = null
 
-        if (path == null || totalMovement < DRAG_MIN_MOVEMENT_PX) {
-            injectTap(x, y)
-            return
+            if (path == null || totalMovement < DRAG_MIN_MOVEMENT_PX) {
+                injectTap(x, y)
+                return
+            }
+
+            path.lineTo(x, y)
+
+            // ── RENDER BUG 2 FIX: cap to MAX_SYSTEM_GESTURE_MS so Android's system
+            // gesture recogniser (Home/Recents swipe) plays at native speed. ────────
+            val durationMs = (totalMovement * DRAG_MS_PER_PX)
+                .toLong()
+                .coerceIn(80L, MAX_SYSTEM_GESTURE_MS)
+
+            val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs, false)
+            val gesture = GestureDescription.Builder().addStroke(stroke).build()
+            dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(g: GestureDescription?) { Log.d(TAG, "Drag ended at ($x, $y) in ${durationMs}ms.") }
+                override fun onCancelled(g: GestureDescription?) { Log.w(TAG, "Drag end cancelled.") }
+            }, null)
         }
-
-        path.lineTo(x, y)
-
-        // ── RENDER BUG 2 FIX: cap to MAX_SYSTEM_GESTURE_MS so Android's system
-        // gesture recogniser (Home/Recents swipe) plays at native speed. ────────
-        val durationMs = (totalMovement * DRAG_MS_PER_PX)
-            .toLong()
-            .coerceIn(80L, MAX_SYSTEM_GESTURE_MS)
-
-        val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs, false)
-        val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(g: GestureDescription?) { Log.d(TAG, "Drag ended at ($x, $y) in ${durationMs}ms.") }
-            override fun onCancelled(g: GestureDescription?) { Log.w(TAG, "Drag end cancelled.") }
-        }, null)
     }
 
     private fun cancelDrag() {
-        dragAccumPath = null
-        anchorStroke = null
-        isLeftButtonDown = false
-        dragStartX = 0f; dragStartY = 0f
-        dragLastX = 0f; dragLastY = 0f
-        Log.d(TAG, "Drag cancelled (state reset).")
+        synchronized(dragLock) {
+            dragAccumPath = null
+            anchorStroke = null
+            isLeftButtonDown = false
+            dragStartX = 0f; dragStartY = 0f
+            dragLastX = 0f; dragLastY = 0f
+            Log.d(TAG, "Drag cancelled (state reset).")
+        }
     }
 
     // ── Unlock ────────────────────────────────────────────────────────────────

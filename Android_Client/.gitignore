@@ -1,0 +1,65 @@
+# ====================================================================
+# Android & Gradle Core (Never track build outputs or local settings)
+# ====================================================================
+build/
+**/build/
+.gradle/
+local.properties
+
+# ====================================================================
+# Keystores & Sensitive Files (CRITICAL: Never leak signing keys!)
+# ====================================================================
+*.jks
+*.keystore
+*.p12
+*.key
+*.pk8
+secure.properties
+secrets.properties
+
+# ====================================================================
+# IDE & Editor Specifics (Android Studio / Cursor / VS Code)
+# ====================================================================
+.idea/
+*.iml
+*.ipr
+*.iws
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/assetWizardSettings.xml
+.idea/modules.xml
+.idea/caches/
+.idea/libraries/
+
+# Cursor / VS Code / Sublime
+.vscode/
+.history/
+*.sublime-project
+*.sublime-workspace
+
+# ====================================================================
+# OS Specific Files (Linux / macOS / Windows)
+# ====================================================================
+# Linux clutter
+.directory
+.Trash-*
+*~
+
+# macOS clutter
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows clutter
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ====================================================================
+# Log & Temp files
+# ====================================================================
+*.log
+*.tmp
+*.bak
+.thumdata*
+captures/
